@@ -1662,6 +1662,20 @@ def build_parser() -> argparse.ArgumentParser:
             "random default is what you want for normal use."
         ),
     )
+    ui.add_argument(
+        "--public", action="store_true",
+        help=(
+            "Public-deployment mode (intended for messagechain.org).  "
+            "Drops the loopback bind / Host-header / startup-token "
+            "gates -- /v1/* read routes become open and /wallet/* "
+            "routes accept per-session sign-in via POST /wallet/login.  "
+            "EXPLICITLY OPTS INTO a broader threat model where the "
+            "server holds users' PKs in memory for the duration of "
+            "their session.  Pair with --bind 0.0.0.0 (or a real "
+            "interface) and a reverse proxy terminating TLS.  For "
+            "personal use, run WITHOUT this flag (loopback wallet)."
+        ),
+    )
 
     return parser
 
@@ -9137,30 +9151,42 @@ def cmd_notify_status(args):
 
 
 def cmd_ui(args):
-    """Run the local wallet UI server.
+    """Run the wallet UI server (loopback by default; --public for
+    deployments to a real interface).
 
-    Loads the user's private key into process memory (unless
-    ``--read-only``), then starts the loopback HTTP wallet server.
-    See messagechain/network/local_wallet_server.py for the threat
-    model and the four foot-gun defenses (loopback bind, Host-header
-    allowlist, per-session bearer token, no CORS).
+    Local mode: loads the user's private key into process memory
+    from --keyfile (or --read-only), token-gates every request, and
+    refuses non-loopback binds.
+
+    Public mode (--public): drops the loopback bind, opens /v1/*
+    read routes to anonymous browsers, and accepts per-session
+    sign-in via POST /wallet/login.  Each browser holds one signed-
+    in entity in server memory for the user-chosen session
+    duration.  Threat model is broader -- a server compromise leaks
+    every active session's PK -- so this is intended for the
+    deliberately-discoverable demo deployment, not personal use.
     """
     from messagechain.network.local_wallet_server import (
         LocalWalletServer,
         LoopbackBindError,
     )
 
-    print("=== MessageChain Local Wallet UI ===\n")
+    public_mode = bool(getattr(args, "public", False))
+    if public_mode:
+        print("=== MessageChain Wallet UI (PUBLIC mode) ===\n")
+        print("Public deployment: /v1/* are open; /wallet/* require")
+        print("per-session sign-in via POST /wallet/login.  Loaded PKs")
+        print("live in server memory for the session duration -- a")
+        print("server compromise leaks every active session.  Pair")
+        print("with TLS at the reverse proxy.\n")
+    else:
+        print("=== MessageChain Local Wallet UI ===\n")
 
     entity = None
-    if args.read_only:
-        print("Mode: read-only (no key loaded; no signing routes)\n")
+    if args.read_only or public_mode:
+        if args.read_only:
+            print("Mode: read-only (no key loaded; sign-in via UI)\n")
     else:
-        # Resolve and load the wallet key.  First-ever load on a host
-        # without the keypair_cache pays the WOTS+ keygen cost up
-        # front (~minutes); subsequent starts are cache HITs in ms.
-        # Doing this BEFORE the server starts means the operator
-        # never sees a wallet route hang on a slow first sign.
         try:
             private_key = _resolve_private_key(args, personal_wallet=True)
         except KeyFileError as e:
@@ -9170,8 +9196,6 @@ def cmd_ui(args):
         entity = _resolve_signing_entity(private_key, args)
         print(f"Loaded entity: {entity.entity_id_hex[:16]}...\n")
 
-    # Resolve the local validator's RPC endpoint for chain reads
-    # (/v1/*) and tx submission (/wallet/* writes, in follow-ups).
     rpc_host, rpc_port = _parse_server(args.server)
 
     try:
@@ -9183,20 +9207,31 @@ def cmd_ui(args):
             entity=entity,
             rpc_endpoint=(rpc_host, rpc_port),
             data_dir=getattr(args, "data_dir", None),
+            public_mode=public_mode,
         )
     except LoopbackBindError as e:
         print(f"Error: {e}")
         sys.exit(1)
 
     server.start()
-    print(f"Wallet UI listening on {server.url}")
-    print()
-    print("This URL contains a per-session token.  Treat it like a password:")
-    print("anyone who can read it can drive the wallet routes.  The token")
-    print("rotates on every restart; sharing the URL across machines is unsafe.")
+    if public_mode:
+        # Public deployment: anyone can browse anonymously, then
+        # sign in via the UI.  No startup token to protect; the URL
+        # is the public address.
+        host_disp = "[" + args.bind + "]" if ":" in args.bind else args.bind
+        print(f"Wallet UI listening on http://{host_disp}:{args.port}/")
+        print()
+        print("Anonymous: read-only feed (/v1/* open).")
+        print("Sign in via UI -> session token returned (POST /wallet/login).")
+    else:
+        print(f"Wallet UI listening on {server.url}")
+        print()
+        print("This URL contains a per-session token.  Treat it like a password:")
+        print("anyone who can read it can drive the wallet routes.  The token")
+        print("rotates on every restart; sharing the URL across machines is unsafe.")
     print()
 
-    if not args.no_browser:
+    if not args.no_browser and not public_mode:
         try:
             import webbrowser
             webbrowser.open(server.url)

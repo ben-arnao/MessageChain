@@ -595,6 +595,8 @@
     <span id="you-stake" class="pill" title="your staked tokens"></span>
     <span id="you-sigs" class="pill" title="WOTS+ one-time signatures left on your current key tree (rotate-key to refresh)"></span>
     <span id="you-chain" class="pill" title="current chain height (read from your local validator's RPC)"></span>
+    <button id="auth-signin" style="display:none;" class="primary">Sign in</button>
+    <button id="auth-signout" style="display:none;">Sign out</button>
   </div>
   <nav class="tabs">
     <button data-tab="feed" class="active">Feed</button>
@@ -946,6 +948,7 @@ async function refreshMe() {
     // panel stays visible in read-only mode and clicking the submit
     // buttons returns 503 -- "buttons that don't do what they say".
     document.body.classList.toggle("readonly", m.mode === "read-only");
+    updateAuthButtons(m);
     if (m.mode === "read-only") {
       youMode.textContent = "read-only";
       youMode.className = "pill warn";
@@ -994,12 +997,27 @@ async function refreshChainStatus() {
     }
     c.textContent = "h=" + r.data.height;
     c.className = "pill ok";
+    // Mode hint -- drives sign-in modal warnings + button visibility.
+    if (r.data.wallet_mode === "public" || r.data.wallet_mode === "local") {
+      WALLET_MODE = r.data.wallet_mode;
+    }
     return r.data;
   } catch (_) {
     $("you-chain").textContent = "chain offline";
     $("you-chain").className = "pill error";
     return null;
   }
+}
+
+// Update the top-right Sign In / Sign Out button visibility.  Sign
+// In shows whenever no entity is loaded for this session AND we're
+// in a mode that supports sign-in (public always; local always --
+// even local users can swap wallets without restart).  Sign Out
+// shows when a wallet IS loaded.
+function updateAuthButtons(me) {
+  const signedIn = me && me.mode === "wallet";
+  $("auth-signin").style.display = signedIn ? "none" : "inline-block";
+  $("auth-signout").style.display = signedIn ? "inline-block" : "none";
 }
 
 // ============================================================= Composer
@@ -2272,6 +2290,175 @@ function confirmAction(opts) {
   });
 }
 
+// ===================================================== Sign-in / sign-out
+//
+// Two flows share the same underlying POST /wallet/login:
+//   * LOCAL mode (loopback wallet, single user) -- the modal
+//     overlays a new entity onto the bootstrap session.  No
+//     duration picker needed (process-lifetime).
+//   * PUBLIC mode (messagechain.org-style deploy) -- the modal
+//     mints a fresh session_id with the user-chosen duration.
+//     Stored in localStorage so a refresh keeps the user signed in
+//     until the duration expires.
+//
+// Public-mode UX is explicitly discouraged for serious wallets:
+// the server holds the PK in memory for the session.  The modal
+// shows a warning and recommends running messagechain ui locally.
+
+let WALLET_MODE = "local";  // populated from /v1/info on boot
+
+function openSigninModal() {
+  $("modal-title").textContent = "Sign in";
+  const body = $("modal-body");
+  body.innerHTML = "";
+  if (WALLET_MODE === "public") {
+    const warn = document.createElement("div");
+    warn.className = "pubkey-warn";
+    warn.style.marginBottom = "0.6rem";
+    warn.innerHTML =
+      "<strong>Heads up.</strong>  This is a public-deployment wallet UI.  " +
+      "Your private key will live in the server's memory for the " +
+      "session duration.  A server compromise during that window " +
+      "would leak your key.  For real wallets, install MessageChain " +
+      "and run <code>messagechain ui</code> locally instead.";
+    body.appendChild(warn);
+  }
+  const label = document.createElement("label");
+  label.style.display = "block";
+  label.style.marginBottom = "0.4rem";
+  label.style.color = "var(--muted)";
+  label.style.fontSize = "0.9rem";
+  label.textContent = "Paste your 24-word mnemonic, 72-char checksummed hex, or 64-char raw hex:";
+  body.appendChild(label);
+  const ta = document.createElement("textarea");
+  ta.id = "signin-pk";
+  ta.placeholder = "abc def ghi … (24 words) — or — abcd1234… (hex)";
+  ta.style.minHeight = "5em";
+  ta.spellcheck = false;
+  body.appendChild(ta);
+
+  // Or upload a keyfile.  Reads the file as text, dumps into the
+  // textarea (so the user sees what's about to be sent and the
+  // backend's existing decode_private_key parses it).
+  const fileLabel = document.createElement("label");
+  fileLabel.className = "hint";
+  fileLabel.style.display = "block";
+  fileLabel.style.marginTop = "0.5rem";
+  fileLabel.textContent = "or load from a keyfile: ";
+  const file = document.createElement("input");
+  file.type = "file";
+  file.accept = ".key,.txt,.mnemonic,*";
+  file.addEventListener("change", async () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      ta.value = txt.trim();
+    } catch (_) {
+      toast("Failed to read keyfile", "err");
+    }
+  });
+  fileLabel.appendChild(file);
+  body.appendChild(fileLabel);
+
+  // Duration picker (PUBLIC mode only -- LOCAL mode is process-life).
+  let durationSelect = null;
+  if (WALLET_MODE === "public") {
+    const dl = document.createElement("label");
+    dl.style.display = "block";
+    dl.style.marginTop = "0.6rem";
+    dl.style.color = "var(--muted)";
+    dl.style.fontSize = "0.9rem";
+    dl.textContent = "Stay signed in for: ";
+    durationSelect = document.createElement("select");
+    durationSelect.style.font = "inherit";
+    durationSelect.style.padding = "0.25rem 0.45rem";
+    durationSelect.innerHTML =
+      '<option value="3600">1 hour</option>' +
+      '<option value="86400" selected>1 day</option>' +
+      '<option value="604800">1 week</option>' +
+      '<option value="2592000">30 days (max)</option>';
+    dl.appendChild(durationSelect);
+    body.appendChild(dl);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const cancel = document.createElement("button");
+  cancel.textContent = "Cancel";
+  const ok = document.createElement("button");
+  ok.className = "primary";
+  ok.textContent = "Sign in";
+  actions.appendChild(cancel);
+  actions.appendChild(ok);
+  body.appendChild(actions);
+
+  cancel.addEventListener("click", closeModal);
+  ok.addEventListener("click", async () => {
+    const value = ta.value.trim();
+    if (!value) { toast("Paste your key first", "err"); return; }
+    const duration = durationSelect
+      ? parseInt(durationSelect.value, 10) : 86400;
+    ok.disabled = true;
+    ok.textContent = "Signing in (may take minutes on first load)…";
+    try {
+      const r = await apiPost("/wallet/login", {
+        value: value, duration_sec: duration,
+      });
+      if (r.status !== 200 || !r.data || !r.data.ok) {
+        toast(
+          "Sign in failed: " +
+          ((r.data && r.data.error) || ("HTTP " + r.status)),
+          "err",
+        );
+        ok.disabled = false;
+        ok.textContent = "Sign in";
+        return;
+      }
+      // Replace stored token with the freshly-issued session id.
+      // In LOCAL mode the server returns the bootstrap token so this
+      // is a no-op; in PUBLIC mode it's a brand-new token.
+      const sid = r.data.session_id;
+      if (sid) sessionStorage.setItem(TOKEN_KEY, sid);
+      closeModal();
+      toast("Signed in as " + shortHex(r.data.entity_id, 8, 6), "ok");
+      await refreshMe();
+      refreshFeed();
+    } finally {
+      ok.disabled = false;
+      ok.textContent = "Sign in";
+    }
+  });
+  showModal();
+  setTimeout(() => ta.focus(), 0);
+}
+
+async function signOut() {
+  const ok = await confirmAction({
+    title: "Sign out",
+    body: "End this session?  Your private key will be cleared from " +
+      "server memory.  You can sign back in any time.",
+    okLabel: "Sign out",
+  });
+  if (!ok) return;
+  try {
+    await apiPost("/wallet/logout", {});
+  } catch (_) {}
+  // In PUBLIC mode the session id is gone server-side too; in LOCAL
+  // mode the bootstrap session entity is cleared but the token still
+  // works.  Either way: drop the local token so the UI re-renders
+  // anonymously and the user can sign in fresh.
+  if (WALLET_MODE === "public") {
+    sessionStorage.removeItem(TOKEN_KEY);
+  }
+  toast("Signed out", "ok");
+  await refreshMe();
+  refreshFeed();
+}
+
+$("auth-signin").addEventListener("click", openSigninModal);
+$("auth-signout").addEventListener("click", signOut);
+
 // ============================================================ Wallet tab
 async function refreshWallet() {
   const me = await refreshMe();
@@ -2706,8 +2893,13 @@ async function refreshNode() {
 
 // =================================================================== boot
 (async function init() {
+  // Pull /v1/info FIRST so WALLET_MODE is set before we decide
+  // whether a missing token is an error.  In public mode the page
+  // loads anonymously by design; in local mode no token = the user
+  // navigated to the bare URL and we should surface the error.
+  await refreshChainStatus();
   const t = bootstrapToken();
-  if (!t) {
+  if (!t && WALLET_MODE !== "public") {
     toast("No session token in URL.  Restart with `messagechain ui`.", "err");
     return;
   }
@@ -2725,7 +2917,7 @@ async function refreshNode() {
   loadFeedPrefs();
   $("feed-time").value = String(FEED_TIME_WINDOW_SEC);
   $("feed-sort").value = FEED_SORT;
-  await Promise.all([refreshMe(), refreshChainStatus()]);
+  await refreshMe();
   await refreshFeed();
   // Restore any in-flight composer draft (typed text that survived a
   // refresh / accidental Esc / chain-reject).  Done AFTER the first

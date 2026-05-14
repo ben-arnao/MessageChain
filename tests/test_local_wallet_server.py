@@ -612,7 +612,16 @@ class TestWalletSend(_WalletServerTestBase):
         conn.close()
         self.assertEqual(status, 503)
         self.assertFalse(data["ok"])
-        self.assertIn("read-only", data["error"])
+        # Iter-7 reworded the error to "no wallet loaded for this
+        # session -- sign in first" so that PUBLIC mode anonymous
+        # callers get the same message a LOCAL --read-only caller
+        # does.  Either phrasing carries the same UX signal: load
+        # a wallet to write.
+        self.assertTrue(
+            "wallet" in data["error"].lower()
+            or "sign in" in data["error"].lower(),
+            data["error"],
+        )
 
     def test_token_required(self):
         srv, port = self._spin_up()
@@ -1329,11 +1338,186 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             "renderThreadedCard",
             "computeReputation",
             "TIP_CAP",
+            # Iteration 7: sign-in / sign-out / mode detection.
+            'id="auth-signin"',
+            'id="auth-signout"',
+            "/wallet/login",
+            "/wallet/logout",
+            "openSigninModal",
+            "WALLET_MODE",
         ]:
             self.assertIn(
                 needle, body_text,
                 f"wallet/index.html no longer contains {needle!r}",
             )
+
+
+# -----------------------------------------------------------------
+# Sign-in / sign-out (iter 7).  POST /wallet/login takes a mnemonic
+# / hex / raw-hex private key, builds an Entity, and (a) overlays
+# the bootstrap session in LOCAL mode or (b) mints a new session in
+# PUBLIC mode.  POST /wallet/logout ends the current session.
+#
+# Tests use a deterministic 32-byte private key; conftest pins
+# MERKLE_TREE_HEIGHT=4 so Entity.create takes ~50ms.
+# -----------------------------------------------------------------
+class _LoginMixin:
+    def _post(self, port, path, token, body_dict):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+        conn.request("POST", path, body=json.dumps(body_dict), headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read()
+        conn.close()
+        # 401/403/404 paths return text; tolerate that so the test
+        # body can still inspect status without choking on JSON parse.
+        try:
+            body = json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            body = {"raw": raw.decode("utf-8", errors="replace")}
+        return status, body
+
+
+class TestWalletLoginLocalMode(_WalletServerTestBase, _LoginMixin):
+    def test_login_with_raw_hex_loads_entity(self):
+        # LOCAL mode (default): no entity at start; login overlays
+        # the bootstrap session so subsequent /wallet/me reflects
+        # the loaded identity.
+        srv, port = self._spin_up()
+        from messagechain.identity.identity import Entity
+        deterministic_pk = bytes(range(32))
+        expected = Entity.create(deterministic_pk).entity_id_hex
+        # Login (POST + no prior auth required).
+        status, body = self._post(port, "/wallet/login", None, {
+            "value": deterministic_pk.hex(),
+        })
+        self.assertEqual(status, 200, msg=body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["entity_id"], expected)
+        # The returned session_id IS the bootstrap token in LOCAL mode.
+        self.assertEqual(body["session_id"], srv.token)
+        # /wallet/me now reflects the loaded entity.
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        s, _, mb = self._request(port, "GET", "/wallet/me", headers=headers)
+        self.assertEqual(s, 200)
+        me = json.loads(mb)
+        self.assertEqual(me["mode"], "wallet")
+        self.assertEqual(me["entity_id"], expected)
+
+    def test_login_rejects_garbage(self):
+        srv, port = self._spin_up()
+        status, body = self._post(port, "/wallet/login", None, {
+            "value": "not a real key",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(body["ok"])
+
+    def test_logout_clears_bootstrap_entity(self):
+        srv, port = self._spin_up()
+        # Login first.
+        self._post(port, "/wallet/login", None, {"value": bytes(range(32)).hex()})
+        # Confirm /wallet/me is wallet-mode now.
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        _, _, before = self._request(port, "GET", "/wallet/me", headers=headers)
+        self.assertEqual(json.loads(before)["mode"], "wallet")
+        # Logout (token still works, just no entity).
+        status, body = self._post(port, "/wallet/logout", srv.token, {})
+        self.assertEqual(status, 200)
+        # /wallet/me back to read-only; bootstrap token still valid.
+        _, _, after = self._request(port, "GET", "/wallet/me", headers=headers)
+        self.assertEqual(json.loads(after)["mode"], "read-only")
+
+
+class TestWalletLoginPublicMode(_WalletServerTestBase, _LoginMixin):
+    def _spin_up_public(self, **kwargs):
+        # Public mode: bind=127.0.0.1 still (test environment) but
+        # the server's public_mode flag changes the auth model:
+        # /v1/* + /wallet/me are open, anonymous; /wallet/login
+        # mints a fresh session id; bootstrap token is NOT a valid
+        # session.
+        port = _find_free_port()
+        defaults = dict(
+            blockchain=_StubChain(),
+            port=port,
+            bind="127.0.0.1",
+            public_mode=True,
+        )
+        defaults.update(kwargs)
+        server = LocalWalletServer(**defaults)
+        server.start()
+        for _ in range(50):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            server.stop()
+            raise RuntimeError("LocalWalletServer never came up")
+        self.addCleanup(server.stop)
+        return server, port
+
+    def test_anonymous_v1_info_accessible_without_token(self):
+        rpc = _make_fake_rpc({
+            "get_chain_info": lambda p: {"ok": True, "result": {"height": 1}},
+        })
+        srv, port = self._spin_up_public(rpc_caller=rpc)
+        status, _, body = self._request(port, "GET", "/v1/info")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["wallet_mode"], "public")
+
+    def test_anonymous_wallet_me_returns_read_only(self):
+        srv, port = self._spin_up_public()
+        status, _, body = self._request(port, "GET", "/wallet/me")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["mode"], "read-only")
+
+    def test_anonymous_wallet_send_returns_401(self):
+        srv, port = self._spin_up_public()
+        status, body = self._post(port, "/wallet/send", None, {
+            "message": "x", "fee": 1,
+        })
+        self.assertEqual(status, 401)
+
+    def test_login_mints_session_and_unlocks_wallet_me(self):
+        srv, port = self._spin_up_public()
+        # Login mints a session.
+        status, body = self._post(port, "/wallet/login", None, {
+            "value": bytes(range(32)).hex(),
+            "duration_sec": 3600,
+        })
+        self.assertEqual(status, 200, msg=body)
+        sid = body["session_id"]
+        # Session id is NOT the bootstrap token in public mode.
+        self.assertNotEqual(sid, srv.token)
+        # /wallet/me with the new session token returns wallet mode.
+        headers = {"Authorization": f"Bearer {sid}"}
+        s, _, mb = self._request(port, "GET", "/wallet/me", headers=headers)
+        me = json.loads(mb)
+        self.assertEqual(s, 200)
+        self.assertEqual(me["mode"], "wallet")
+        self.assertEqual(me["entity_id"], body["entity_id"])
+        self.assertIsNotNone(me["session_expires_at"])
+
+    def test_logout_invalidates_session(self):
+        srv, port = self._spin_up_public()
+        _, body = self._post(port, "/wallet/login", None, {
+            "value": bytes(range(32)).hex(),
+        })
+        sid = body["session_id"]
+        # Logout via the session token.
+        status, _ = self._post(port, "/wallet/logout", sid, {})
+        self.assertEqual(status, 200)
+        # Subsequent /wallet/send with the dead session -> 401.
+        status, _ = self._post(port, "/wallet/send", sid, {
+            "message": "x", "fee": 1,
+        })
+        self.assertEqual(status, 401)
 
 
 if __name__ == "__main__":

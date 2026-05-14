@@ -70,6 +70,8 @@ import os
 import secrets
 import socketserver
 import threading
+import time
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -83,6 +85,46 @@ __all__ = [
     "LocalWalletServer",
     "LoopbackBindError",
 ]
+
+
+# --- Multi-session entity store ---------------------------------------
+#
+# In LOCAL mode (loopback bind, single operator) there is typically
+# one session: the bootstrap token printed in the URL maps to the
+# --keyfile-loaded entity (or to a no-entity placeholder under
+# --read-only).  Sign-in via the browser overlays a new entity on
+# the same session.
+#
+# In PUBLIC mode (--public, 0.0.0.0 bind, many users) each browser
+# starts anonymous.  Sign-in mints a fresh random session_id and
+# stores the entity against it; the browser sends that session_id
+# on every /wallet/* request.  Sessions expire after the user-
+# selected duration so a left-open tab does not keep a PK in server
+# memory forever.
+#
+# The same in-memory dict serves both modes.  No PK ever touches
+# disk: load-from-paste keeps it in process memory only, and
+# logout/expiry deletes the entity reference (Python GC reclaims).
+
+@dataclass
+class _Session:
+    entity: object = None         # messagechain.identity.identity.Entity, or None (anon)
+    expires_at: Optional[float] = None  # absolute UNIX time; None = never expires
+
+    def is_expired(self) -> bool:
+        return self.expires_at is not None and self.expires_at < time.time()
+
+
+# Caps to keep session-flooding from exhausting server RAM (a single
+# Entity at production tree height is ~32 MB of WOTS+ tree; even at
+# the tiny test height it's a few KB).  At MAX_SESSIONS the oldest
+# is evicted to make room.
+_MAX_SESSIONS = 64
+# Hard ceiling on session duration regardless of what the user picks
+# in the UI (so a malicious / careless caller cannot pin a PK in
+# server memory for years).
+_MAX_SESSION_SECONDS = 60 * 60 * 24 * 30  # 30 days
+_DEFAULT_SESSION_SECONDS = 60 * 60 * 24    # 1 day -- the iter-7 default
 
 
 # --- Defense 1: loopback bind allowlist --------------------------------
@@ -163,7 +205,12 @@ _INDEX_HTML_PATH = os.path.join(_STATIC_DIR, "index.html")
 
 class _WalletHandlerContext:
     """Per-server shared state.  Held on the server object so handler
-    instances (one per request) can see it without globals."""
+    instances (one per request) can see it without globals.
+
+    Sessions: the auth model.  ``sessions[token]`` -> ``_Session``.
+    The bootstrap token is set up at start (a single session whose
+    entity is the --keyfile one, or None for --read-only / public
+    mode).  Browser sign-in mints additional session_ids."""
 
     def __init__(
         self,
@@ -171,21 +218,91 @@ class _WalletHandlerContext:
         token: str,
         entity=None,
         rpc_caller: Optional[Callable] = None,
+        public_mode: bool = False,
     ):
-        # Optional in the empty-shell phase.  Becomes required when
-        # real read/write routes land.
         self.blockchain = blockchain
-        self.token = token
-        # Optional: an `Entity` (messagechain.identity.identity.Entity)
-        # whose private key the server will use to sign /wallet/*
-        # writes.  None for read-only / shell mode.
-        self.entity = entity
+        self.bootstrap_token = token
+        self.public_mode = public_mode
+        # session_id -> _Session.  In LOCAL mode the bootstrap token
+        # is pre-installed with the --keyfile entity (or no entity
+        # under --read-only); in PUBLIC mode no bootstrap session is
+        # installed -- every signed-in user has their own random id.
+        self.sessions: dict = {}
+        if not public_mode:
+            self.sessions[token] = _Session(entity=entity, expires_at=None)
+        self._sessions_lock = threading.Lock()
         # Callable `(method: str, params: dict) -> dict` returning the
         # JSON-RPC response.  In production this is a thin wrapper
         # around `client.rpc_call(host, port, ...)` for the local
         # validator.  Tests inject a fake to avoid spinning a real
         # validator just to exercise the wallet-side routing.
         self.rpc_caller = rpc_caller
+
+    def add_session(self, entity, duration_sec: int) -> str:
+        """Mint a fresh session_id, register the entity against it, and
+        return the new id.  Caps duration at the safety ceiling and
+        evicts the oldest session if we're at cap."""
+        duration = max(60, min(int(duration_sec), _MAX_SESSION_SECONDS))
+        with self._sessions_lock:
+            if len(self.sessions) >= _MAX_SESSIONS:
+                # Evict the soonest-expiring session.  Bootstrap
+                # session has expires_at=None so it sorts last and is
+                # never evicted by this rule.
+                victim = min(
+                    self.sessions.keys(),
+                    key=lambda k: self.sessions[k].expires_at or float("inf"),
+                )
+                self.sessions.pop(victim, None)
+            sid = secrets.token_urlsafe(32)
+            self.sessions[sid] = _Session(
+                entity=entity,
+                expires_at=time.time() + duration,
+            )
+            return sid
+
+    def end_session(self, sid: str) -> bool:
+        """Remove a session.  Returns True iff it existed."""
+        with self._sessions_lock:
+            return self.sessions.pop(sid, None) is not None
+
+    def get_session(self, sid: Optional[str]) -> Optional[_Session]:
+        """Return the session for sid (or None).  Sweeps expired."""
+        if not sid:
+            return None
+        with self._sessions_lock:
+            sess = self.sessions.get(sid)
+            if sess is None:
+                return None
+            if sess.is_expired():
+                self.sessions.pop(sid, None)
+                return None
+            return sess
+
+    # --- Backwards-compatible single-entity surface ---
+    # Older code paths reference ctx.entity directly.  Surface the
+    # bootstrap session's entity here so they continue to work in
+    # LOCAL mode without a refactor.  In PUBLIC mode this is None.
+    @property
+    def entity(self):
+        sess = self.sessions.get(self.bootstrap_token) if not self.public_mode else None
+        return sess.entity if sess else None
+
+    @entity.setter
+    def entity(self, e):
+        # Legacy mutation path -- replaces the bootstrap session's
+        # entity.  Used by /wallet/login in LOCAL single-user mode
+        # (overlay a new wallet without restarting).  No-op in
+        # public mode (which uses add_session instead).
+        if self.public_mode:
+            return
+        with self._sessions_lock:
+            sess = self.sessions.get(self.bootstrap_token)
+            if sess is not None:
+                sess.entity = e
+            else:
+                self.sessions[self.bootstrap_token] = _Session(
+                    entity=e, expires_at=None,
+                )
 
 
 class _WalletHandler(http.server.BaseHTTPRequestHandler):
@@ -255,6 +372,13 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
     # --- defenses 2 & 3, applied as middleware ------------------------
 
     def _check_host_header_or_reject(self) -> bool:
+        ctx = self.server._wallet_context
+        # In public mode the server is reachable via a real DNS name
+        # (messagechain.org).  The loopback-Host gate would 403 every
+        # legitimate request.  Loopback enforcement only applies to
+        # local mode -- which still gets the DNS-rebinding defense.
+        if ctx.public_mode:
+            return True
         host = self.headers.get("Host", "")
         if not _host_header_is_loopback(host):
             self._send_text(
@@ -270,13 +394,37 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         if provided is None:
             self._send_text(401, "Unauthorized: missing wallet session token")
             return False
-        # Constant-time comparison — token guessing via /wallet/* is
-        # already infeasible at 256-bit entropy, but timing-side-channel
-        # leakage of partial matches is cheap to defend.
-        if not hmac.compare_digest(provided, ctx.token):
-            self._send_text(401, "Unauthorized: invalid wallet session token")
-            return False
-        return True
+        # Constant-time comparison against the bootstrap token covers
+        # local-mode access (--keyfile or --read-only).  In public
+        # mode there's no bootstrap token; sessions are the only auth.
+        if not ctx.public_mode and hmac.compare_digest(provided, ctx.bootstrap_token):
+            return True
+        # Look up against the live session map.  Expired sessions
+        # are GC'd by get_session itself.
+        if ctx.get_session(provided) is not None:
+            return True
+        self._send_text(401, "Unauthorized: invalid or expired wallet session")
+        return False
+
+    def _current_session(self):
+        """Return the _Session for this request (or None).  Used by
+        /wallet/* routes that need to know WHICH user is signing."""
+        ctx = self.server._wallet_context
+        provided = _extract_provided_token(
+            self.headers, urlsplit(self.path).query,
+        )
+        if provided is None:
+            return None
+        if (not ctx.public_mode
+                and hmac.compare_digest(provided, ctx.bootstrap_token)):
+            # Bootstrap path -- the legacy single-entity store.
+            sess = ctx.sessions.get(ctx.bootstrap_token)
+            return sess
+        return ctx.get_session(provided)
+
+    def _current_entity(self):
+        sess = self._current_session()
+        return sess.entity if sess else None
 
     # --- routing ------------------------------------------------------
 
@@ -286,19 +434,27 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
 
         split = urlsplit(self.path)
         path = split.path
+        ctx = self.server._wallet_context
 
         if path in self._TOKEN_BYPASS_PATHS:
             if path == "/health":
                 self._send_json(200, {"ok": True})
                 return
-            # Landing page.  Empty-shell version is a tiny placeholder;
-            # real wallet UI files land in static/wallet/ in follow-ups.
             self._serve_landing_page()
             return
 
-        # All other routes require the session token.
-        if not self._check_token_or_reject(split.query):
-            return
+        # In PUBLIC mode the /v1/* read routes are public-facing
+        # (anyone can browse the chain on messagechain.org without
+        # signing in).  /wallet/me is also open in public mode so the
+        # SPA can render the anonymous "Sign in" affordance without
+        # a token.  /wallet/* writes + everything else still require
+        # a valid session.
+        public_open = ctx.public_mode and (
+            path.startswith("/v1/") or path == "/wallet/me"
+        )
+        if not public_open:
+            if not self._check_token_or_reject(split.query):
+                return
 
         if path == "/wallet/ping":
             # Sentinel route used by the landing page to confirm the
@@ -363,11 +519,21 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             return
         split = urlsplit(self.path)
         path = split.path
-        # Every POST route is a write op -- token-required, no
-        # bypass-listing.  Do the token check before any body parse.
+
+        # /wallet/login is the entry point -- it MUST work without
+        # prior auth so an anonymous browser (public mode) or a
+        # --read-only local startup can sign in.  Every other write
+        # route requires a valid session.
+        if path == "/wallet/login":
+            self._serve_wallet_login_post()
+            return
+
         if not self._check_token_or_reject(split.query):
             return
 
+        if path == "/wallet/logout":
+            self._serve_wallet_logout_post()
+            return
         if path == "/wallet/send":
             self._serve_wallet_send_post()
             return
@@ -414,6 +580,150 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
             return False, {"error": f"invalid JSON body: {type(e).__name__}"}
 
+    # --- sign-in / sign-out -------------------------------------------
+
+    def _serve_wallet_login_post(self):
+        """POST /wallet/login
+
+        Body:
+          { "value": "<24-word mnemonic | 72-char checksummed hex |
+                       64-char raw hex>",
+            "duration_sec": <int seconds, default 86400, max 30 days> }
+
+        Builds an ``Entity`` from the supplied private-key material
+        and either:
+          * (LOCAL mode) replaces the bootstrap session's entity --
+            single-user model; subsequent /wallet/* requests using
+            the bootstrap token sign as the new identity.
+          * (PUBLIC mode) mints a fresh random session id and stores
+            the entity against it; returns ``{session_id, expires_at}``
+            so the browser can use it as the Bearer token from then
+            on.
+
+        IMPORTANT security note for PUBLIC mode: the server holds the
+        loaded PK in process memory for the session's lifetime.  The
+        UI surfaces a clear warning that this trust model is weaker
+        than running the wallet locally.  PK never touches disk."""
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        value = body.get("value", "")
+        if not isinstance(value, str) or not value.strip():
+            self._send_json(400, {
+                "ok": False,
+                "error": "value required (paste hex / mnemonic / keyfile contents)",
+            })
+            return
+        try:
+            duration_sec = int(body.get("duration_sec", _DEFAULT_SESSION_SECONDS))
+        except (TypeError, ValueError):
+            duration_sec = _DEFAULT_SESSION_SECONDS
+
+        # Parse the input.  decode_private_key accepts mnemonic +
+        # 72-char checksummed hex; we add explicit support for the
+        # 64-char raw hex form too (operator-paste convenience).
+        from messagechain.identity.key_encoding import (
+            decode_private_key,
+            InvalidKeyChecksumError,
+            InvalidKeyFormatError,
+        )
+        stripped = value.strip()
+        try:
+            private_key = decode_private_key(stripped)
+        except InvalidKeyChecksumError as e:
+            self._send_json(400, {
+                "ok": False,
+                "error": f"checksum mismatch -- looks like a typo: {e}",
+            })
+            return
+        except InvalidKeyFormatError:
+            # Fall back to raw 64-hex (no checksum protection -- the
+            # daemon-format keyfile some operators have).
+            low = stripped.lower()
+            if len(low) == 64:
+                try:
+                    private_key = bytes.fromhex(low)
+                    if len(private_key) != 32:
+                        raise ValueError("not 32 bytes")
+                except ValueError:
+                    self._send_json(400, {
+                        "ok": False,
+                        "error": "invalid hex (expected 32 raw bytes / 64 hex chars)",
+                    })
+                    return
+            else:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": (
+                        "could not decode -- expected a 24-word mnemonic, "
+                        "a 72-char checksummed hex, or a 64-char raw hex"
+                    ),
+                })
+                return
+
+        # Build the Entity.  Slow on first-ever load of a new key
+        # (full WOTS+ keygen); fast on cache hit.  The HTTP request
+        # blocks for the full duration -- callers should expect
+        # minutes the very first time.  PK is consumed after this
+        # call returns; only the derived Entity (which holds the
+        # signing seed, NOT the original PK) is stored in memory.
+        try:
+            from messagechain.cli import _resolve_signing_entity
+            entity = _resolve_signing_entity(private_key, args=None)
+        except Exception as e:
+            logger.warning(
+                "wallet login keygen failed: %s", type(e).__name__,
+            )
+            self._send_json(500, {
+                "ok": False,
+                "error": f"keygen failed ({type(e).__name__})",
+            })
+            return
+        # Drop the raw PK reference NOW, before storing the session
+        # (the Entity holds a derived seed only).
+        private_key = None
+
+        ctx = self.server._wallet_context
+        if ctx.public_mode:
+            sid = ctx.add_session(entity, duration_sec)
+            self._send_json(200, {
+                "ok": True,
+                "session_id": sid,
+                "expires_at": ctx.sessions[sid].expires_at,
+                "entity_id": entity.entity_id_hex,
+            })
+        else:
+            # LOCAL single-user mode: overlay the bootstrap session.
+            ctx.entity = entity  # property setter mutates bootstrap
+            self._send_json(200, {
+                "ok": True,
+                "session_id": ctx.bootstrap_token,
+                "expires_at": None,
+                "entity_id": entity.entity_id_hex,
+            })
+
+    def _serve_wallet_logout_post(self):
+        """POST /wallet/logout -- end the current session.
+
+        In LOCAL mode this clears the bootstrap session's entity
+        (the user is back to read-only without losing their token).
+        In PUBLIC mode it removes the session entirely; subsequent
+        requests with the same Bearer token get 401."""
+        ctx = self.server._wallet_context
+        provided = _extract_provided_token(
+            self.headers, urlsplit(self.path).query,
+        )
+        if (not ctx.public_mode and provided
+                and hmac.compare_digest(provided, ctx.bootstrap_token)):
+            ctx.entity = None  # property setter
+            self._send_json(200, {"ok": True})
+            return
+        if provided:
+            ctx.end_session(provided)
+        self._send_json(200, {"ok": True})
+
     # --- wallet write routes ------------------------------------------
 
     def _send_op_result(self, result: dict):
@@ -425,7 +735,8 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
         err = (result.get("error") or "").lower()
-        if "unreachable" in err or "read-only" in err:
+        if ("unreachable" in err or "read-only" in err
+                or "no wallet loaded" in err):
             status = 503
         elif "must" in err and (
             "string" in err or "integer" in err or "bytes" in err
@@ -437,15 +748,18 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(status, result)
 
     def _require_entity_or_503(self):
-        """Return ctx.entity if loaded, otherwise send 503 and return None."""
-        ctx = self.server._wallet_context
-        if ctx.entity is None:
+        """Return the current request's session entity if loaded,
+        otherwise send 503 and return None.  Per-session in public
+        mode (each browser has its own); single-entity in local
+        mode (the bootstrap session)."""
+        entity = self._current_entity()
+        if entity is None:
             self._send_json(503, {
                 "ok": False,
-                "error": "wallet running in read-only mode (no key loaded)",
+                "error": "no wallet loaded for this session -- sign in first",
             })
             return None
-        return ctx.entity
+        return entity
 
     def _serve_wallet_send_post(self):
         """POST /wallet/send -- sign + submit a message tx.
@@ -841,10 +1155,13 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
     # --- wallet identity / "you" panel --------------------------------
 
     def _serve_wallet_me(self):
+        sess = self._current_session()
         ctx = self.server._wallet_context
-        if ctx.entity is None:
-            # Read-only mode -- the page renders this as "no wallet
-            # loaded; restart with --keyfile to enable signing".
+        entity = sess.entity if sess else None
+        if entity is None:
+            # No wallet loaded for this session.  In LOCAL mode this
+            # is the --read-only path; in PUBLIC mode it's any
+            # anonymous browser before sign-in.
             self._send_json(200, {
                 "ok": True,
                 "mode": "read-only",
@@ -858,27 +1175,18 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
                 "stake": None,
                 "pubkey_registered": None,
                 "sigs_remaining": None,
+                "session_expires_at": None,
             })
             return
 
-        entity_id_hex = ctx.entity.entity_id_hex
+        entity_id_hex = entity.entity_id_hex
 
-        # Best-effort RPC pull for on-chain stats.  An unreachable
-        # validator should NOT take the whole panel down -- the local
-        # entity_id + leaf accounting are still useful, so return
-        # what we have with the on-chain fields set to null.
         ok, ent_resp = self._rpc("get_entity", {"entity_id": entity_id_hex})
         on_chain: dict = {}
         if ok and isinstance(ent_resp, dict) and ent_resp.get("ok"):
             on_chain = ent_resp.get("result") or {}
 
-        # WOTS+ remaining-signature count.  Each `_next_leaf` advance
-        # consumes one one-time leaf; running out is a hard signing
-        # stop.  Surfaced so the UI can warn the user before it bites
-        # (the rotate-key flow is what they need next).  Pulled from
-        # private attrs because the public surface doesn't expose them
-        # -- an internal-only read, never written.
-        keypair = getattr(ctx.entity, "keypair", None)
+        keypair = getattr(entity, "keypair", None)
         num_leaves = getattr(keypair, "num_leaves", None)
         next_leaf = getattr(keypair, "_next_leaf", None)
         if isinstance(num_leaves, int) and isinstance(next_leaf, int):
@@ -886,13 +1194,8 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         else:
             sigs_remaining = None
 
-        # Audit r55 #1: surface the mc1...-checksummed address so the
-        # Identity tab can render the typo-protected form that the
-        # CLI's `cmd_account` already tells users to share when
-        # receiving funds.  Raw entity_id stays for back-compat /
-        # internal use; the UI prefers ``address``.
         from messagechain.identity.address import encode_address
-        addr = encode_address(ctx.entity.entity_id)
+        addr = encode_address(entity.entity_id)
 
         self._send_json(200, {
             "ok": True,
@@ -903,6 +1206,7 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             "stake": on_chain.get("stake"),
             "pubkey_registered": on_chain.get("pubkey_registered"),
             "sigs_remaining": sigs_remaining,
+            "session_expires_at": sess.expires_at if sess else None,
         })
 
     # --- read-side RPC proxies ----------------------------------------
@@ -935,8 +1239,7 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(502, info_resp)
             return
         info = info_resp.get("result") or {}
-        # Reshape into the public-feed /v1/info contract so client JS
-        # written against the public feed renders verbatim here.
+        ctx = self.server._wallet_context
         body = {
             "ok": True,
             "chain_id": CHAIN_ID.decode("ascii", errors="replace"),
@@ -945,11 +1248,14 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             "state_root": info.get("state_root"),
             "height": info.get("height"),
             "last_block_timestamp": info.get("last_block_timestamp"),
-            # Faucet / quickpost are operator-side public-feed knobs
-            # and have no analogue here — the wallet UI signs its own
-            # txs from the loaded entity.
             "faucet_enabled": False,
             "quickpost_enabled": False,
+            # Mode hint for the SPA: "local" = single-user loopback
+            # wallet (this is your machine), "public" = shared deploy
+            # (sign-in expected, server holds your PK during the
+            # session).  The UI renders different top-right
+            # affordances per mode.
+            "wallet_mode": "public" if ctx.public_mode else "local",
         }
         self._send_json(200, body)
 
@@ -1055,14 +1361,14 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
     def _serve_v1_proposals(self, query: str):
         """GET /v1/proposals  --  proxy list_proposals.
 
-        When an entity is loaded, ``voter_id`` is auto-filled with
-        the loaded entity_id so each row carries a ``voted`` flag
-        the UI uses to dim already-voted proposals."""
-        # Auto-fill voter_id from the loaded entity when available.
-        ctx = self.server._wallet_context
+        When an entity is loaded for THIS request's session,
+        ``voter_id`` is auto-filled so each row carries a ``voted``
+        flag the UI uses to dim already-voted proposals.  Per-session
+        in PUBLIC mode (each browser sees its own voted-flags)."""
         params: dict = {}
-        if ctx.entity is not None:
-            params["voter_id"] = ctx.entity.entity_id_hex
+        per_session_entity = self._current_entity()
+        if per_session_entity is not None:
+            params["voter_id"] = per_session_entity.entity_id_hex
         # Allow caller to override (e.g. inspecting another entity's
         # voting record from the UI later).
         qparams = parse_qs(query or "")
@@ -1132,11 +1438,20 @@ class LocalWalletServer:
         rpc_endpoint: tuple = ("127.0.0.1", 9334),
         rpc_caller: Optional[Callable] = None,
         data_dir: Optional[str] = None,
+        public_mode: bool = False,
     ):
-        _validate_loopback_bind(bind)
+        # Public mode RELAXES the loopback bind check -- the wallet UI
+        # is intended to be deployable to messagechain.org as a single
+        # SPA shared with local users.  When public_mode=True, callers
+        # are explicitly opting into the broader threat model
+        # (server holds users' PKs in memory for their session
+        # duration).  Loopback enforcement still applies in local mode.
+        if not public_mode:
+            _validate_loopback_bind(bind)
         self.blockchain = blockchain
         self.port = port
         self.bind = bind
+        self.public_mode = public_mode
         self.token = token if token is not None else _generate_session_token()
         self.entity = entity
         self.rpc_endpoint = tuple(rpc_endpoint)
@@ -1189,6 +1504,7 @@ class LocalWalletServer:
             token=self.token,
             entity=self.entity,
             rpc_caller=self.rpc_caller,
+            public_mode=self.public_mode,
         )
         ctx.data_dir = self.data_dir
         self._httpd._wallet_context = ctx
