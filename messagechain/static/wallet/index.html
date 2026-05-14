@@ -194,9 +194,6 @@
     gap: 0.4rem;
     flex-direction: column;
     margin-top: 0.5rem;
-    padding: 0.5rem;
-    border: 1px dashed var(--border);
-    border-radius: 6px;
   }
   .composer.poll-mode .poll-options { display: flex; }
   .composer .poll-options label { color: var(--muted); font-size: 0.8rem; }
@@ -211,7 +208,6 @@
     transition: background-color 0.6s ease;
   }
   .msg.flash { background: var(--highlight); }
-  .msg.poll-card { border-color: var(--accent); }
   .msg .meta {
     font-size: 0.82rem;
     color: var(--muted);
@@ -1132,51 +1128,84 @@ composerPollToggle.addEventListener("change", () => {
   saveComposerDraft();
 });
 
+// Fire-and-forget: optimistically clear the composer + toast "sending"
+// the instant the user clicks, then update the toast when /wallet/send
+// returns.  We deliberately don't wait for the tx to land in a block
+// (signing alone -- WOTS+ leaf derivation -- can take a few seconds and
+// makes the form feel like it's hung); the periodic feed poll surfaces
+// it shortly after.
 composerPost.addEventListener("click", async () => {
   const text = composerText.value.trim();
   if (!text) return;
-  const fee = await liveFee(utf8Bytes(text));
-  const body = { message: text, fee: fee };
-  if (composerCommunity.value.trim()) body.community_id = composerCommunity.value.trim();
-  if (composerPollToggle.checked) {
-    const opts = [1, 2, 3, 4]
+  const isPoll = composerPollToggle.checked;
+  let pollOpts = null;
+  if (isPoll) {
+    pollOpts = [1, 2, 3, 4]
       .map(i => $("composer-poll-" + i).value.trim())
       .filter(s => s.length > 0);
-    if (opts.length < 2) {
+    if (pollOpts.length < 2) {
       toast("Polls need at least 2 options", "err");
       return;
     }
-    body.poll_options = opts;
-    // The chain charges proposal-style for poll txs; bump fee to the
-    // higher floor when posting one.
-    body.fee = Math.max(body.fee, 500);
   }
-  composerPost.disabled = true;
+  // Snapshot composer state for restore-on-failure, then optimistically
+  // clear so the user sees instant feedback.
+  const savedText = composerText.value;
+  const savedCommunity = composerCommunity.value;
+  const savedPoll = isPoll;
+  const savedPollOptions = [1, 2, 3, 4].map(i => $("composer-poll-" + i).value);
   const oldLabel = composerPost.textContent;
-  composerPost.textContent = "Posting…";
+  composerPost.disabled = true;
+  composerPost.textContent = "Sending…";
+  composerText.value = "";
+  composerCommunity.value = "";
+  if (isPoll) {
+    composerPollToggle.checked = false;
+    composerPollToggle.dispatchEvent(new Event("change"));
+    [1, 2, 3, 4].forEach(i => { $("composer-poll-" + i).value = ""; });
+  }
+  _lastFeeBytes = -1;
+  clearComposerDraft();
+  updateComposerMeta();
+  toast(isPoll ? "Opening poll…" : "Sending post…", "ok");
+  function restoreComposer() {
+    composerText.value = savedText;
+    composerCommunity.value = savedCommunity;
+    if (savedPoll) {
+      composerPollToggle.checked = true;
+      composerPollToggle.dispatchEvent(new Event("change"));
+      [1, 2, 3, 4].forEach((i, idx) => {
+        $("composer-poll-" + i).value = savedPollOptions[idx] || "";
+      });
+    }
+    saveComposerDraft();
+    updateComposerMeta();
+  }
   try {
+    const fee = await liveFee(utf8Bytes(text));
+    const body = { message: text, fee: fee };
+    if (savedCommunity.trim()) body.community_id = savedCommunity.trim();
+    if (isPoll) {
+      body.poll_options = pollOpts;
+      // Chain charges proposal-style for poll txs; bump fee to the
+      // higher floor when posting one.
+      body.fee = Math.max(body.fee, 500);
+    }
     const r = await apiPost("/wallet/send", body);
     if (r.status === 200) {
-      toast("Posted: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-      composerText.value = "";
-      composerCommunity.value = "";
-      if (composerPollToggle.checked) {
-        composerPollToggle.checked = false;
-        composerPollToggle.dispatchEvent(new Event("change"));
-        [1, 2, 3, 4].forEach(i => { $("composer-poll-" + i).value = ""; });
-      }
-      _lastFeeBytes = -1;
-      clearComposerDraft();
-      updateComposerMeta();
-      forceFeedRefresh(r.data.result.tx_hash);
+      toast((isPoll ? "Poll opened ✓ " : "Posted ✓ ") +
+        shortHex(r.data.result.tx_hash, 8, 6), "ok");
       refreshMe();
     } else {
-      // Leave the composer text alone so the user can edit + retry.
-      // The draft auto-save preserves it across a refresh too.
-      toast("Send failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+      restoreComposer();
+      toast("Send failed: " +
+        ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
     }
+  } catch (e) {
+    restoreComposer();
+    toast("Send failed: " + (e && e.message || "network error"), "err");
   } finally {
-    composerPost.disabled = false;
+    composerPost.disabled = composerText.value.trim().length === 0;
     composerPost.textContent = oldLabel;
   }
 });
@@ -1596,7 +1625,6 @@ function renderMessageCard(m, allMsgs) {
   const card = document.createElement("div");
   card.className = "msg";
   if (m.tx_hash) card.id = "tx-" + m.tx_hash;
-  if (m.kind === "poll") card.classList.add("poll-card");
 
   // ------ meta row (entity + permalink + timestamp)
   const meta = document.createElement("div");
@@ -1611,20 +1639,15 @@ function renderMessageCard(m, allMsgs) {
 
   const right = document.createElement("span");
   right.className = "right";
-  if (typeof m.block_number === "number") {
-    const blk = document.createElement("span");
-    blk.textContent = "block " + m.block_number;
-    blk.title = "block " + m.block_number;
-    right.appendChild(blk);
-  }
   if (m.tx_hash) {
     const link = document.createElement("a");
     link.href = "#tx-" + m.tx_hash;
-    link.title = formatTs(m.timestamp) + " · permalink";
+    link.title = formatTs(m.timestamp);
     link.textContent = relTime(m.timestamp);
     right.appendChild(link);
   } else {
     const ts = document.createElement("span");
+    ts.title = formatTs(m.timestamp);
     ts.textContent = relTime(m.timestamp);
     right.appendChild(ts);
   }
@@ -1865,10 +1888,29 @@ function makeInlineReply(tx_hash) {
   row.appendChild(post);
   wrap.appendChild(row);
 
-  ta.addEventListener("input", () => {
-    meta.textContent = utf8Bytes(ta.value) + " bytes";
+  // Fee preview is debounced behind the bytes count: bytes update on
+  // every keystroke, the live fee quote replaces the text once the
+  // RPC returns.  Shape mirrors the main composer.
+  let lastFeeBytes = -1;
+  async function refreshReplyMeta() {
+    const bytes = utf8Bytes(ta.value);
+    meta.textContent = bytes + " bytes";
     post.disabled = ta.value.trim().length === 0;
-  });
+    if (bytes > 0 && bytes !== lastFeeBytes) {
+      lastFeeBytes = bytes;
+      try {
+        const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
+        if (r.status === 200 && r.data && r.data.result &&
+            utf8Bytes(ta.value) === bytes) {
+          meta.textContent = bytes + " bytes  ·  ~" +
+            r.data.result.fee_estimate + " token fee";
+        }
+      } catch (_) {}
+    } else if (bytes === 0) {
+      lastFeeBytes = -1;
+    }
+  }
+  ta.addEventListener("input", refreshReplyMeta);
   ta.addEventListener("keydown", e => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !post.disabled) {
       post.click();
@@ -1876,28 +1918,45 @@ function makeInlineReply(tx_hash) {
   });
   post.disabled = true;
 
+  // Fire-and-forget: as soon as the local-wallet RPC returns we toast
+  // "sent" and close the form -- we deliberately do NOT wait for the
+  // tx to land in a block, since signing alone (WOTS+ leaf
+  // derivation) can take several seconds and the user perceives the
+  // form as "hanging" through that window.  The next periodic poll
+  // (every 12s) will surface the reply in the feed.
   post.addEventListener("click", async () => {
     const text = ta.value.trim();
     if (!text) return;
-    const fee = await liveFee(utf8Bytes(text));
+    const savedText = ta.value;
+    ta.value = "";
+    wrap.classList.remove("open");
+    meta.textContent = "0 bytes";
+    lastFeeBytes = -1;
     post.disabled = true;
-    post.textContent = "Posting…";
+    toast("Sending reply…", "ok");
     try {
+      const fee = await liveFee(utf8Bytes(text));
       const r = await apiPost("/wallet/send", {
         message: text, fee: fee, prev: tx_hash,
       });
       if (r.status === 200) {
-        toast("Reply posted", "ok");
-        ta.value = "";
-        wrap.classList.remove("open");
-        forceFeedRefresh(r.data.result.tx_hash);
+        toast("Reply sent ✓", "ok");
         refreshMe();
       } else {
-        toast("Reply failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+        // Restore the user's text so they can edit and retry.
+        ta.value = savedText;
+        wrap.classList.add("open");
+        refreshReplyMeta();
+        toast("Reply failed: " +
+          ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
       }
+    } catch (e) {
+      ta.value = savedText;
+      wrap.classList.add("open");
+      refreshReplyMeta();
+      toast("Reply failed: " + (e && e.message || "network error"), "err");
     } finally {
-      post.disabled = false;
-      post.textContent = "Reply";
+      post.disabled = ta.value.trim().length === 0;
     }
   });
   return wrap;
