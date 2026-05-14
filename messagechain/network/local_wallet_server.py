@@ -344,6 +344,14 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             # already-voted entries.
             self._serve_v1_proposals(split.query)
             return
+        if path == "/v1/profile":
+            # Rich entity profile (balance, stake, first-seen block,
+            # fees_paid, governance + reaction stats).  Backs the
+            # profile modal's reputation score (sqrt(age_blocks *
+            # fees_paid)).  Heavier than /v1/entity (O(N) chain walk)
+            # so call it on-demand, not in a poll loop.
+            self._serve_v1_profile(split.query)
+            return
         if path == "/wallet/estimate-fee":
             self._serve_wallet_estimate_fee(split.query)
             return
@@ -1017,6 +1025,32 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(503, {"ok": False, **resp})
             return
         self._send_json(200 if resp.get("ok") else 404, resp)
+
+    def _serve_v1_profile(self, query: str):
+        """GET /v1/profile?id=<64-hex>  --  proxy get_entity_profile.
+
+        Returns the rich profile dict from compute_entity_profile so
+        the wallet UI's profile modal can render reputation + activity
+        history.  O(N) chain walk on the validator side -- meant for
+        on-demand opens, not poll loops."""
+        params = parse_qs(query or "")
+        raw_id = (params.get("id") or [""])[0].strip().lower()
+        if not raw_id or len(raw_id) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be a 64-char hex entity_id",
+            })
+            return
+        try:
+            bytes.fromhex(raw_id)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "id must be valid hex"})
+            return
+        ok, resp = self._rpc("get_entity_profile", {"entity_id": raw_id})
+        if not ok:
+            self._send_json(503, {"ok": False, **resp})
+            return
+        self._send_json(200 if resp.get("ok") else 502, resp)
 
     def _serve_v1_proposals(self, query: str):
         """GET /v1/proposals  --  proxy list_proposals.

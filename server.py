@@ -1802,6 +1802,36 @@ class Server(SharedRuntimeMixin):
         elif method == "get_entity":
             return self._rpc_get_entity(request["params"])
 
+        elif method == "get_entity_profile":
+            # Rich entity profile -- balance + stake + first-seen
+            # block + fees_paid + governance + reactions + reputation
+            # subscores.  Used by the wallet UI's profile modal to
+            # render a complete view (incl. derived reputation =
+            # sqrt(age_blocks * fees_paid)).  Reuses the same chain-
+            # walk PublicFeedServer's /v1/entity calls.  Cost is O(N)
+            # in chain length per call -- acceptable for an on-demand
+            # profile open, not for a poll loop.
+            params = request.get("params", {}) or {}
+            entity_id = parse_hex(
+                params.get("entity_id", ""), expected_len=32,
+            )
+            if entity_id is None:
+                return {
+                    "ok": False,
+                    "error": "Invalid entity_id (must be 32 bytes hex)",
+                }
+            from messagechain.network.entity_profile import (
+                compute_entity_profile,
+            )
+            try:
+                profile = compute_entity_profile(self.blockchain, entity_id)
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"compute_entity_profile failed: {type(e).__name__}",
+                }
+            return {"ok": True, "result": profile}
+
         elif method == "get_chain_info":
             info = self.blockchain.get_chain_info()
             info["sync_status"] = self.syncer.get_sync_status()

@@ -934,6 +934,49 @@ class TestWalletReact(_WalletServerTestBase, _RealEntityMixin):
         self.assertEqual(status, 400)
 
 
+class TestV1Profile(_WalletServerTestBase):
+    def test_returns_profile_payload(self):
+        sample_profile = {
+            "entity_id": "ab" * 32,
+            "exists": True,
+            "user_since": {"block_number": 100, "timestamp": 1_700_000_000},
+            "messages": {"total": 5},
+            "balance": 1234,
+            "fees_paid": 250,
+            "reputation": {"score": 7, "ups_received": 3, "downs_received": 0},
+        }
+        rpc = _make_fake_rpc({
+            "get_entity_profile": lambda p: {
+                "ok": True, "result": sample_profile,
+            },
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        eid = "ab" * 32
+        status, _, body = self._request(
+            port, "GET", f"/v1/profile?id={eid}", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"]["fees_paid"], 250)
+        self.assertEqual(data["result"]["user_since"]["block_number"], 100)
+
+    def test_invalid_id_returns_400(self):
+        rpc = _make_fake_rpc({})
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, _ = self._request(
+            port, "GET", "/v1/profile?id=garbage", headers=headers,
+        )
+        self.assertEqual(status, 400)
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        status, _, _ = self._request(port, "GET", "/v1/profile?id=" + "ab" * 32)
+        self.assertEqual(status, 401)
+
+
 class TestV1Proposals(_WalletServerTestBase):
     def _proposal_row(self, pid_hex, title, voted=None):
         row = {
@@ -1277,6 +1320,15 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             "setCommunityFilter",
             "classifyRecipient",
             "renderProposal",
+            # Iteration 6 affordances.
+            'id="feed-time"',
+            'id="feed-sort"',
+            'id="feed-community"',
+            "/v1/profile",
+            "buildThreadedView",
+            "renderThreadedCard",
+            "computeReputation",
+            "TIP_CAP",
         ]:
             self.assertIn(
                 needle, body_text,

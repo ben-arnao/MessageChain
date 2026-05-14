@@ -282,6 +282,94 @@
   }
   .filter-chip.show { display: inline-flex; }
   .filter-chip button { background: transparent; border: none; color: var(--accent); padding: 0; cursor: pointer; }
+  .feed-toolbar {
+    display: flex;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 0.5rem 0.7rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 0.6rem;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .feed-toolbar label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .feed-toolbar select {
+    font: inherit;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.2rem 0.4rem;
+  }
+  /* Threading: nest replies under their parent with a left rail.  Up
+     to 3 levels visually distinct, deeper still nests but flattens
+     to the same indent (avoids horizontal scroll on long chains). */
+  .replies {
+    margin-left: 1.2rem;
+    border-left: 2px solid var(--border);
+    padding-left: 0.7rem;
+    margin-top: 0.4rem;
+  }
+  .msg.is-reply { margin-bottom: 0.4rem; }
+  /* Inline poll-vote summary: collapsed by default, click to expand. */
+  .poll-vote-summary {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px dashed var(--border);
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .poll-vote-summary .toggle {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    cursor: pointer;
+    font: inherit;
+  }
+  .poll-vote-summary .toggle:hover { text-decoration: underline; }
+  .poll-vote-list {
+    display: none;
+    margin-top: 0.4rem;
+    padding-left: 0.6rem;
+    border-left: 2px dashed var(--border);
+  }
+  .poll-vote-summary.open .poll-vote-list { display: block; }
+  .poll-vote-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.15rem 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .poll-vote-row .voter {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .poll-vote-row .voter:hover { text-decoration: underline; }
+  /* Reputation badge in profile modal. */
+  .rep-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.4rem 0.7rem;
+    border-radius: 999px;
+    font-size: 0.95rem;
+    margin-bottom: 0.6rem;
+  }
+  .rep-badge .score { font-weight: 600; font-size: 1.1rem; }
   .proposal {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -540,6 +628,29 @@
       <span class="grow"></span>
       <button id="composer-post" class="primary" disabled>Post</button>
     </div>
+  </div>
+
+  <div class="feed-toolbar">
+    <label>Time
+      <select id="feed-time">
+        <option value="3600">past hour</option>
+        <option value="86400" selected>past 24 hours</option>
+        <option value="604800">past week</option>
+        <option value="0">all time</option>
+      </select>
+    </label>
+    <label>Sort
+      <select id="feed-sort">
+        <option value="upvotes" selected>most upvotes</option>
+        <option value="newest">newest</option>
+      </select>
+    </label>
+    <label>Community
+      <select id="feed-community">
+        <option value="">all communities</option>
+        <option value="__none__">(none)</option>
+      </select>
+    </label>
   </div>
 
   <div class="new-activity" id="new-activity">
@@ -1056,6 +1167,28 @@ let CURRENT_MESSAGES = [];
 // cards whose community_id matches.  Persisted into the URL hash so
 // reloads / shared links keep the filter.
 let CURRENT_COMMUNITY = null;
+// Toolbar-driven view controls (Reddit/Twitter-style).  Defaults:
+// past 24h, sort by upvotes, all communities.  Persisted in
+// localStorage so they survive page reloads.
+const FEED_PREFS_KEY = "mc.wallet.feed-prefs";
+let FEED_TIME_WINDOW_SEC = 86400;
+let FEED_SORT = "upvotes";
+function loadFeedPrefs() {
+  try {
+    const raw = localStorage.getItem(FEED_PREFS_KEY);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    if (typeof p.time === "number") FEED_TIME_WINDOW_SEC = p.time;
+    if (p.sort === "upvotes" || p.sort === "newest") FEED_SORT = p.sort;
+  } catch (_) {}
+}
+function saveFeedPrefs() {
+  try {
+    localStorage.setItem(FEED_PREFS_KEY, JSON.stringify({
+      time: FEED_TIME_WINDOW_SEC, sort: FEED_SORT,
+    }));
+  } catch (_) {}
+}
 
 const newActivity = $("new-activity");
 $("new-activity-btn").addEventListener("click", () => {
@@ -1085,10 +1218,54 @@ function setCommunityFilter(name) {
   } else {
     window.history.replaceState({}, "", window.location.pathname + txAnchor);
   }
+  // Sync the toolbar dropdown so the active filter is also reflected
+  // there.  Adds the option dynamically if the value isn't in the
+  // current option set (e.g. landing via #c=... before the dropdown
+  // has been populated).
+  const sel = $("feed-community");
+  let found = false;
+  Array.from(sel.options).forEach(o => {
+    if (CURRENT_COMMUNITY && o.value === CURRENT_COMMUNITY) found = true;
+  });
+  if (CURRENT_COMMUNITY && !found) {
+    const opt = document.createElement("option");
+    opt.value = CURRENT_COMMUNITY;
+    opt.textContent = "/c/" + CURRENT_COMMUNITY;
+    sel.appendChild(opt);
+  }
+  sel.value = CURRENT_COMMUNITY || "";
   // Always switch to the Feed tab when filtering -- the chip lives there.
   switchTab("feed");
   refreshFeed();
 }
+
+// Toolbar listeners.
+$("feed-time").addEventListener("change", () => {
+  FEED_TIME_WINDOW_SEC = parseInt($("feed-time").value, 10) || 0;
+  saveFeedPrefs();
+  refreshFeed();
+});
+$("feed-sort").addEventListener("change", () => {
+  FEED_SORT = $("feed-sort").value;
+  saveFeedPrefs();
+  refreshFeed();
+});
+$("feed-community").addEventListener("change", () => {
+  const v = $("feed-community").value;
+  if (v === "__none__") {
+    // Special pseudo-filter: only messages with no community_id.
+    CURRENT_COMMUNITY = "__none__";
+    filterChipName.textContent = "(no community)";
+    filterChip.classList.add("show");
+  } else if (v) {
+    setCommunityFilter(v);
+    return;
+  } else {
+    setCommunityFilter(null);
+    return;
+  }
+  refreshFeed();
+});
 
 // Snapshot any open inline-reply forms before a feed re-render.
 // Without this, refreshing the feed (manual click of the new-activity
@@ -1128,12 +1305,11 @@ async function refreshFeed() {
   const list = $("feed-list");
   const empty = $("feed-empty");
   try {
-    // When a community filter is active, fetch a deeper window so the
-    // filter has more chance of matching.  100 is the validator-side
-    // get_messages cap; PUBLIC_FEED_MAX_LIMIT clamps higher requests
-    // anyway.
-    const limit = CURRENT_COMMUNITY ? 100 : 30;
-    const r = await api("/v1/latest?limit=" + limit);
+    // Always fetch the deepest window the validator allows -- the
+    // toolbar's time-window filter cuts client-side, so a deeper
+    // server fetch gives the "past hour" view a chance of finding
+    // anything on a slow chain.
+    const r = await api("/v1/latest?limit=50");
     if (r.status !== 200) {
       list.innerHTML = "";
       empty.style.display = "block";
@@ -1144,23 +1320,66 @@ async function refreshFeed() {
     CURRENT_MESSAGES = allMsgs;
     LAST_HEIGHT = r.data.height || LAST_HEIGHT;
     LAST_TOP_HASH = allMsgs.length ? allMsgs[0].tx_hash : null;
-    const msgs = CURRENT_COMMUNITY
-      ? allMsgs.filter(m => m.community_id === CURRENT_COMMUNITY)
-      : allMsgs;
-    if (msgs.length === 0) {
+
+    // Populate the community dropdown with whatever communities are
+    // actually present in the visible window.  Idempotent -- skips
+    // duplicates.
+    const communitySet = new Set();
+    allMsgs.forEach(m => { if (m.community_id) communitySet.add(m.community_id); });
+    const sel = $("feed-community");
+    const existing = new Set(Array.from(sel.options).map(o => o.value));
+    [...communitySet].sort().forEach(c => {
+      if (!existing.has(c)) {
+        const opt = document.createElement("option");
+        opt.value = c;
+        opt.textContent = "/c/" + c;
+        sel.appendChild(opt);
+      }
+    });
+
+    // Build the threaded view: replies fold under their parent, poll
+    // votes fold into the poll's vote summary.  Top-level messages
+    // are everything that isn't either of those.
+    const threaded = buildThreadedView(allMsgs);
+    let tops = threaded.tops;
+
+    // Apply community filter on TOP-LEVEL only (replies always render
+    // under their visible parent regardless).
+    if (CURRENT_COMMUNITY === "__none__") {
+      tops = tops.filter(m => !m.community_id);
+    } else if (CURRENT_COMMUNITY) {
+      tops = tops.filter(m => m.community_id === CURRENT_COMMUNITY);
+    }
+
+    // Apply time-window filter on TOP-LEVEL.  Replies under a visible
+    // top stay (a 5h-old comment on a 2m-old top should still show).
+    if (FEED_TIME_WINDOW_SEC > 0) {
+      const minTs = (Date.now() / 1000) - FEED_TIME_WINDOW_SEC;
+      tops = tops.filter(m => (m.timestamp || 0) >= minTs);
+    }
+
+    // Apply sort.
+    if (FEED_SORT === "upvotes") {
+      tops.sort((a, b) =>
+        (b.ups || 0) - (a.ups || 0) ||
+        (b.timestamp || 0) - (a.timestamp || 0));
+    } else {
+      tops.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    }
+
+    if (tops.length === 0) {
       list.innerHTML = "";
       empty.style.display = "block";
-      empty.textContent = CURRENT_COMMUNITY
-        ? "No messages in /c/" + CURRENT_COMMUNITY + " in the last " + limit + " on chain."
-        : "No messages on chain yet.";
+      empty.textContent = "No posts match the current filters.  " +
+        "Try widening the time window or clearing the community filter.";
       return;
     }
     empty.style.display = "none";
     const replyState = snapshotInlineReplies();
     list.innerHTML = "";
-    // Always render against the FULL window so vote-on-poll cross-
-    // references resolve even if the poll itself is filtered out.
-    msgs.forEach(m => list.appendChild(renderMessageCard(m, allMsgs)));
+    tops.forEach(m => list.appendChild(
+      renderThreadedCard(m, allMsgs, threaded, 0)
+    ));
     restoreInlineReplies(replyState);
     // Honor URL-hash deep link if any.
     if (window.location.hash.startsWith("#tx-")) {
@@ -1218,6 +1437,136 @@ function forceFeedRefresh(myNewTxHash) {
       }
     }
   });
+}
+
+// Group the visible message window into a threaded structure.
+//   * `replies`: tx_hash -> [child reply messages]
+//   * `pollVotes`: poll_tx_hash -> [vote messages targeting that poll]
+//   * `tops`: messages that should render at the root level
+//
+// A reply nests when its `prev` resolves to a visible parent.  A vote
+// always folds under its target poll (visible or not -- the chain
+// always knows the poll exists; if it isn't in our window, the vote
+// just doesn't render top-level either, matching the user's "auto-
+// display polls and threads instead of as their own separate txs"
+// directive).
+function buildThreadedView(allMsgs) {
+  const byHash = new Map();
+  allMsgs.forEach(m => byHash.set(m.tx_hash, m));
+  const replies = new Map();
+  const pollVotes = new Map();
+  const isReply = new Set();
+  const isVote = new Set();
+  for (const m of allMsgs) {
+    if (m.kind === "vote" && m.vote_target && m.vote_target.poll_txid) {
+      const k = m.vote_target.poll_txid;
+      const list = pollVotes.get(k) || [];
+      list.push(m);
+      pollVotes.set(k, list);
+      isVote.add(m.tx_hash);
+      continue;
+    }
+    if (m.prev && byHash.has(m.prev)) {
+      const list = replies.get(m.prev) || [];
+      list.push(m);
+      replies.set(m.prev, list);
+      isReply.add(m.tx_hash);
+    }
+  }
+  const tops = allMsgs.filter(m =>
+    !isVote.has(m.tx_hash) && !isReply.has(m.tx_hash)
+  );
+  // Sort each reply chain newest-first within the thread (same as
+  // top-level newest sort -- threads always read newest-leaf-first).
+  replies.forEach(arr =>
+    arr.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)));
+  pollVotes.forEach(arr =>
+    arr.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)));
+  return { tops, replies, pollVotes };
+}
+
+// Render a top-level card and recursively its reply children.  Depth
+// is purely a visual indent driver (capped in CSS via the .replies
+// nesting style; deeper than ~3 still nests but stops indenting
+// further to avoid horizontal scroll).
+function renderThreadedCard(m, allMsgs, threaded, depth) {
+  const card = renderMessageCard(m, allMsgs);
+  if (depth > 0) card.classList.add("is-reply");
+  // Inline poll-vote summary (collapsed by default).
+  if (m.kind === "poll") {
+    const votes = threaded.pollVotes.get(m.tx_hash) || [];
+    if (votes.length > 0) {
+      card.appendChild(renderPollVoteSummary(m, votes, allMsgs));
+    }
+  }
+  // Recurse into replies.
+  const kids = threaded.replies.get(m.tx_hash);
+  if (kids && kids.length > 0) {
+    const wrap = document.createElement("div");
+    wrap.className = "replies";
+    kids.forEach(k =>
+      wrap.appendChild(renderThreadedCard(k, allMsgs, threaded, depth + 1)));
+    card.appendChild(wrap);
+  }
+  return card;
+}
+
+function renderPollVoteSummary(poll, votes, allMsgs) {
+  // Tally + collapsible voter list.  Reads option text from the
+  // poll's poll_options so the summary is human-readable without
+  // a per-vote chain lookup.
+  const summary = document.createElement("div");
+  summary.className = "poll-vote-summary";
+  const counts = (poll.poll_options || []).map((opt, idx) => ({
+    idx, text: opt,
+    count: votes.filter(v => v.vote_target && v.vote_target.option_index === idx).length,
+  }));
+  const total = votes.length;
+  const top = document.createElement("div");
+  const toggle = document.createElement("button");
+  toggle.className = "toggle";
+  toggle.textContent = total + " vote" + (total === 1 ? "" : "s") + "  ▾";
+  toggle.addEventListener("click", () => {
+    const open = summary.classList.toggle("open");
+    toggle.textContent = total + " vote" + (total === 1 ? "" : "s") +
+      (open ? "  ▴" : "  ▾");
+  });
+  top.appendChild(toggle);
+  // Inline tally summary (always visible).
+  const tally = document.createElement("span");
+  tally.style.marginLeft = "0.5rem";
+  tally.textContent = counts
+    .filter(c => c.count > 0)
+    .map(c => '"' + c.text + '" ' + c.count)
+    .join("  ·  ");
+  if (tally.textContent) top.appendChild(tally);
+  summary.appendChild(top);
+  // Expanded per-voter list.
+  const list = document.createElement("div");
+  list.className = "poll-vote-list";
+  votes.forEach(v => {
+    const row = document.createElement("div");
+    row.className = "poll-vote-row";
+    const voter = document.createElement("span");
+    voter.className = "voter";
+    voter.title = v.entity_id || "";
+    voter.textContent = (YOU && YOU.entity_id === v.entity_id)
+      ? "you" : shortHex(v.entity_id, 8, 4);
+    voter.addEventListener("click", () => openProfileModal(v.entity_id));
+    const what = document.createElement("span");
+    const idx = v.vote_target && v.vote_target.option_index;
+    const optText = (poll.poll_options && poll.poll_options[idx]) || ("option " + idx);
+    what.textContent = ' voted "' + optText + '"';
+    const when = document.createElement("span");
+    when.style.marginLeft = "auto";
+    when.textContent = relTime(v.timestamp);
+    row.appendChild(voter);
+    row.appendChild(what);
+    row.appendChild(when);
+    list.appendChild(row);
+  });
+  summary.appendChild(list);
+  return summary;
 }
 
 function renderMessageCard(m, allMsgs) {
@@ -1631,19 +1980,41 @@ async function votePoll(pollTx, idx, optText) {
   }
 }
 
+// Hard cap on amounts driven by the per-card 💸 tip flow.  100
+// tokens is "small enough you can fat-finger it without losing
+// serious money", per the user-explicit safety floor.  The Wallet
+// tab's general Send Tokens form does NOT enforce this -- intentional
+// transfers belong there and aren't capped (a confirm-before-send
+// modal kicks in for amounts > TIP_CAP -- see xfer-submit handler).
+const TIP_CAP = 100;
 function prefillTip(entityId) {
   switchTab("wallet");
-  // Prefer the address form; we don't have it for arbitrary entities,
-  // so we fall back to the raw entity_id (the backend decode_address
-  // accepts both).
   const el = $("xfer-to");
   el.value = entityId;
-  // Fire input so the live validation chip below the field updates
-  // (otherwise the old "✗ recipient must be..." text from a prior
-  // typo lingers, or the field looks unvalidated).
+  // Fire input so the live validation chip below the field updates.
   el.dispatchEvent(new Event("input"));
-  $("xfer-amount").focus();
+  // Pre-fill amount with the cap and clamp the field's max so any
+  // accidental ↑-arrow or fat-finger keypress can't push it past
+  // 100.  User can still type a smaller value.
+  const amt = $("xfer-amount");
+  amt.max = TIP_CAP;
+  amt.value = "";
+  amt.placeholder = "1.." + TIP_CAP + " (tip cap)";
+  amt.focus();
+  toast(
+    "Tip mode: max " + TIP_CAP + " tokens.  Use Wallet -> Send for " +
+    "larger transfers.", "ok",
+  );
 }
+// Whenever the user manually edits the recipient field (instead of
+// arriving via prefillTip), un-cap the amount field so the regular
+// Send-tokens form behaves normally.  The cap is a tip-flow guard,
+// not a UI-wide ceiling.
+$("xfer-to").addEventListener("input", () => {
+  const amt = $("xfer-amount");
+  amt.removeAttribute("max");
+  amt.placeholder = "";
+});
 
 // ============================================================ Profile modal
 async function openProfileModal(entityId) {
@@ -1653,7 +2024,17 @@ async function openProfileModal(entityId) {
   body.innerHTML = "<div class='hint'>Loading…</div>";
   showModal();
   try {
-    const r = await api("/v1/entity?id=" + entityId);
+    // Two parallel fetches: lightweight /v1/entity for the always-
+    // present balance/stake/pubkey fields, and the heavier
+    // /v1/profile for reputation + activity history.  Profile's
+    // O(N) chain walk shouldn't block rendering the cheap fields,
+    // and a profile fetch failure (older validator without
+    // get_entity_profile) should NOT take down the modal.
+    const [entR, profR] = await Promise.all([
+      api("/v1/entity?id=" + entityId),
+      api("/v1/profile?id=" + entityId).catch(() => ({status: 0, data: null})),
+    ]);
+    const r = entR;
     if (r.status !== 200 || !r.data || !r.data.ok) {
       body.innerHTML = "<div class='hint'>Entity not registered on chain " +
         "(receive-to-exist: appears after their first received transfer).</div>";
@@ -1661,8 +2042,12 @@ async function openProfileModal(entityId) {
       return;
     }
     const e = r.data.result;
+    const profile = (profR.status === 200 && profR.data && profR.data.ok)
+      ? profR.data.result : null;
     body.innerHTML = "";
+    if (profile) body.appendChild(renderReputationBadge(profile));
     body.appendChild(renderEntityHeader(entityId, e));
+    if (profile) body.appendChild(renderProfileExtras(profile));
     // Filter the locally-fetched feed for messages from this entity.
     // Without a /v1/entity_messages RPC this is a partial view, but
     // it's free and useful when scrolling a thread.
@@ -1683,6 +2068,80 @@ async function openProfileModal(entityId) {
   } catch (_) {
     body.innerHTML = "<div class='hint'>Profile fetch failed.</div>";
   }
+}
+
+// Reputation = floor(sqrt(age_blocks * fees_paid)).
+//   * age_blocks  = current chain height - entity's first-seen block
+//                   (the earliest block where this entity_id appears
+//                   in any capacity -- sender, recipient, voter, ...)
+//   * fees_paid   = total tokens this entity has ever paid as fees
+//                   across every tx kind (message, transfer, stake,
+//                   react, propose, vote).
+// Square root keeps the score bounded so a years-old whale doesn't
+// dominate by raw arithmetic; both factors must compound to score
+// well, which is the user-explicit reputation shape.
+function computeReputation(profile) {
+  const since = profile.user_since && profile.user_since.block_number;
+  const fees = profile.fees_paid || 0;
+  if (!since || since < 0 || fees < 0) return null;
+  const age = Math.max(0, (LAST_HEIGHT || 0) - since);
+  if (age <= 0) return 0;
+  return Math.floor(Math.sqrt(age * fees));
+}
+
+function renderReputationBadge(profile) {
+  const score = computeReputation(profile);
+  const wrap = document.createElement("div");
+  wrap.className = "rep-badge";
+  if (score === null || score === 0) {
+    wrap.classList.add("warn");
+    wrap.style.background = "var(--warn-bg)";
+    wrap.style.borderColor = "var(--warn)";
+    wrap.style.color = "var(--warn)";
+  }
+  const star = document.createElement("span");
+  star.textContent = "★";
+  const label = document.createElement("span");
+  label.textContent = "Reputation";
+  const s = document.createElement("span");
+  s.className = "score";
+  s.textContent = score == null ? "—" : String(score);
+  const detail = document.createElement("span");
+  detail.style.fontWeight = "400";
+  detail.style.opacity = "0.85";
+  const since = profile.user_since && profile.user_since.block_number;
+  const age = since != null && LAST_HEIGHT
+    ? (LAST_HEIGHT - since) + " blocks old"
+    : "age unknown";
+  detail.textContent = "  ·  " + age + "  ·  " + (profile.fees_paid || 0) + " tokens spent";
+  wrap.appendChild(star);
+  wrap.appendChild(label);
+  wrap.appendChild(s);
+  wrap.appendChild(detail);
+  return wrap;
+}
+
+function renderProfileExtras(profile) {
+  // Compact activity row: messages / proposals / votes / stake-ops
+  // / reactions cast.  Surfaced as plain text under the entity-
+  // header so the profile modal isn't a wall of fields.
+  const wrap = document.createElement("div");
+  wrap.className = "hint";
+  wrap.style.marginTop = "0.5rem";
+  const m = profile.messages || {};
+  const g = profile.governance || {};
+  const t = profile.transfers || {};
+  const so = profile.stake_ops || {};
+  const parts = [];
+  if (m.total) parts.push(m.total + " messages");
+  if (g.proposals_made) parts.push(g.proposals_made + " proposals");
+  if (g.votes_cast) parts.push(g.votes_cast + " gov votes");
+  if (t.sent) parts.push(t.sent + " transfers sent");
+  if (t.received) parts.push(t.received + " transfers received");
+  if (so.stakes) parts.push(so.stakes + " stakes");
+  if (profile.reactions_cast) parts.push(profile.reactions_cast + " reactions cast");
+  wrap.textContent = parts.length ? "Activity:  " + parts.join("  ·  ") : "No activity yet.";
+  return wrap;
 }
 
 function renderEntityHeader(entityId, e) {
@@ -1907,6 +2366,31 @@ $("xfer-submit").addEventListener("click", async () => {
   if (!looksAddr && !looksHex) {
     toast("Recipient must be an mc1… address or 64-hex entity_id", "err");
     return;
+  }
+  // Tip-flow cap: prefillTip pinned `max=TIP_CAP` on the amount
+  // field; reject anything above it.  Native number-input enforces
+  // it for spinners but a manual paste/type past 100 would slip
+  // through the spinner.
+  const amtField = $("xfer-amount");
+  const hardMax = parseInt(amtField.getAttribute("max") || "0", 10) || 0;
+  if (hardMax > 0 && amount > hardMax) {
+    toast("Tip flow caps at " + hardMax + " tokens.  Clear recipient and re-enter for larger transfers.", "err");
+    return;
+  }
+  // Large-transfer guard: explicit confirmation for amounts above
+  // TIP_CAP via the general Send-tokens form too.  Cheap fat-finger
+  // guard ("did you mean 1000 not 10000?").  Skip when in tip mode
+  // (already capped).
+  if (hardMax === 0 && amount > TIP_CAP) {
+    const ok = await confirmAction({
+      title: "Confirm large transfer",
+      body: "Send " + amount + " tokens to:\n\n" + to + "\n\n" +
+        "This is above the " + TIP_CAP + "-token tip cap.  " +
+        "Double-check the recipient and amount before confirming.",
+      okLabel: "Send " + amount + " tokens",
+      okClass: "primary",
+    });
+    if (!ok) return;
   }
   const r = await apiPost("/wallet/transfer", {
     recipient_id: to, amount: amount, fee: fee, include_pubkey: includePk,
@@ -2236,6 +2720,11 @@ async function refreshNode() {
     filterChipName.textContent = "/c/" + cFilter;
     filterChip.classList.add("show");
   }
+  // Restore feed prefs (sort + time window) and reflect into the
+  // toolbar selects so the active state is visible.
+  loadFeedPrefs();
+  $("feed-time").value = String(FEED_TIME_WINDOW_SEC);
+  $("feed-sort").value = FEED_SORT;
   await Promise.all([refreshMe(), refreshChainStatus()]);
   await refreshFeed();
   // Restore any in-flight composer draft (typed text that survived a
