@@ -477,6 +477,22 @@
     margin-bottom: 0.7rem;
     font-size: 0.85rem;
   }
+
+  /* Read-only mode: hide every write surface so the user is never
+     looking at a button that will 503.  The notice replaces them
+     with an explanation of how to enable signing. */
+  .readonly-notice {
+    display: none;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 8px;
+    padding: 0.8rem 1rem;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+  }
+  body.readonly .readonly-notice { display: block; }
+  body.readonly .write-only { display: none !important; }
 </style>
 </head>
 <body>
@@ -541,6 +557,12 @@
 
 <!-- ============================================================ Wallet -->
 <section class="tab-panel" id="tab-wallet">
+  <div class="readonly-notice">
+    <strong>Read-only mode.</strong>  Restart with
+    <code>messagechain --keyfile &lt;path&gt; ui</code> to enable
+    sending tokens, staking, or any other write actions.
+  </div>
+
   <div class="panel">
     <h2>Your wallet</h2>
     <div id="wallet-balance" class="hint">loading…</div>
@@ -549,7 +571,7 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel write-only">
     <h2>Send tokens</h2>
     <div class="form-grid">
       <label>Recipient
@@ -565,7 +587,7 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel write-only">
     <h2>Stake / unstake</h2>
     <div class="form-grid">
       <div class="row-2col">
@@ -589,12 +611,18 @@
 
 <!-- ======================================================= Governance -->
 <section class="tab-panel" id="tab-governance">
+  <div class="readonly-notice">
+    <strong>Read-only mode.</strong>  Open proposals are visible but
+    you can't vote or open new ones until the wallet is loaded with
+    <code>messagechain --keyfile &lt;path&gt; ui</code>.
+  </div>
+
   <div class="panel">
     <h2>Open proposals</h2>
     <div id="proposals-list" class="hint">loading…</div>
   </div>
 
-  <div class="panel">
+  <div class="panel write-only">
     <h2>New proposal</h2>
     <div class="form-grid">
       <label>Title<input id="prop-title" type="text"></label>
@@ -609,7 +637,7 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel write-only">
     <h2>Vote on a proposal</h2>
     <div class="form-grid">
       <label>Proposal ID (64 hex chars)
@@ -796,10 +824,17 @@ async function refreshMe() {
     }
     const m = r.data;
     YOU = m;
+    // Drive a body-level class so write-only forms (transfer, stake,
+    // unstake, governance) hide via CSS.  Without this, every write
+    // panel stays visible in read-only mode and clicking the submit
+    // buttons returns 503 -- "buttons that don't do what they say".
+    document.body.classList.toggle("readonly", m.mode === "read-only");
     if (m.mode === "read-only") {
       youMode.textContent = "read-only";
       youMode.className = "pill warn";
       $("you-id").textContent = "(no wallet loaded)";
+      $("you-id").onclick = null;
+      $("you-id").oncontextmenu = null;
       $("you-balance").textContent = "";
       $("you-stake").textContent = "";
       $("you-sigs").textContent = "";
@@ -1128,6 +1163,17 @@ async function refreshFeed() {
         t.scrollIntoView({ behavior: "smooth", block: "center" });
         t.classList.add("flash");
         setTimeout(() => t.classList.remove("flash"), 3000);
+      } else {
+        // Permalink to a message older than our 30/100-msg window,
+        // OR to a community we're filtered out of.  Without this
+        // toast the click silently does nothing -- "permalink
+        // doesn't work" bug.
+        toast(
+          "That message isn't in the current feed window" +
+          (CURRENT_COMMUNITY ? " (filtered to /c/" + CURRENT_COMMUNITY + ")" : "") +
+          ".  Try clearing filters or scrolling for older messages.",
+          "err",
+        );
       }
     }
   } catch (_) {
@@ -1258,6 +1304,36 @@ function renderMessageCard(m, allMsgs) {
   if (m.kind === "poll" && Array.isArray(m.poll_options)) {
     const list = document.createElement("div");
     list.className = "poll-options-list";
+    // Three reasons option buttons may be disabled:
+    //   1. read-only mode (no wallet loaded)
+    //   2. poll is yours (chain rejects self-vote on own poll)
+    //   3. you've already voted on this poll (chain rejects duplicate)
+    //      Detected by scanning the visible feed for a kind=vote tx
+    //      from YOU pointing at this poll, OR by the local "just-voted"
+    //      set (survives the optimistic refresh before the vote tx
+    //      lands in the next feed pull).
+    const readonly = !YOU || YOU.mode === "read-only";
+    const ownPoll = YOU && YOU.entity_id && m.entity_id === YOU.entity_id;
+    let alreadyVoted = false;
+    if (YOU && YOU.entity_id) {
+      const localVoted = (() => {
+        try {
+          const raw = sessionStorage.getItem("mc.wallet.voted-polls");
+          if (!raw) return new Set();
+          return new Set(JSON.parse(raw));
+        } catch (_) { return new Set(); }
+      })();
+      if (localVoted.has(m.tx_hash)) {
+        alreadyVoted = true;
+      } else {
+        alreadyVoted = (allMsgs || []).some(x =>
+          x.kind === "vote" &&
+          x.entity_id === YOU.entity_id &&
+          x.vote_target &&
+          x.vote_target.poll_txid === m.tx_hash
+        );
+      }
+    }
     m.poll_options.forEach((opt, idx) => {
       const btn = document.createElement("button");
       btn.className = "poll-opt";
@@ -1269,12 +1345,15 @@ function renderMessageCard(m, allMsgs) {
       txt.textContent = opt;
       btn.appendChild(num);
       btn.appendChild(txt);
-      // Self-vote-on-own-poll is rejected at consensus per CLAUDE.md
-      // anchor.  Disable inline so the user gets the signal up front
-      // instead of a "rejected" toast after burning a leaf.
-      if (YOU && YOU.entity_id && m.entity_id === YOU.entity_id) {
+      if (readonly) {
+        btn.disabled = true;
+        btn.title = "Read-only mode -- load a wallet to vote";
+      } else if (ownPoll) {
         btn.disabled = true;
         btn.title = "Cannot vote on your own poll";
+      } else if (alreadyVoted) {
+        btn.disabled = true;
+        btn.title = "You've already voted on this poll (votes are FINAL)";
       } else {
         btn.addEventListener("click", () => votePoll(m.tx_hash, idx, opt));
       }
@@ -1496,6 +1575,17 @@ async function votePoll(pollTx, idx, optText) {
     vote_target: [pollTx, idx],
   });
   if (r.status === 200) {
+    // Track the just-voted poll locally so the option buttons on
+    // this poll's card disable immediately on the next render --
+    // the vote tx itself takes a few seconds to land in a block,
+    // so without this the user could spam clicks and rack up a
+    // string of "already voted" rejection toasts.
+    try {
+      const raw = sessionStorage.getItem("mc.wallet.voted-polls");
+      const set = new Set(raw ? JSON.parse(raw) : []);
+      set.add(pollTx);
+      sessionStorage.setItem("mc.wallet.voted-polls", JSON.stringify([...set]));
+    } catch (_) {}
     toast("Voted: " + optText, "ok");
     refreshMe();
     forceFeedRefresh(r.data.result.tx_hash);
@@ -1509,7 +1599,12 @@ function prefillTip(entityId) {
   // Prefer the address form; we don't have it for arbitrary entities,
   // so we fall back to the raw entity_id (the backend decode_address
   // accepts both).
-  $("xfer-to").value = entityId;
+  const el = $("xfer-to");
+  el.value = entityId;
+  // Fire input so the live validation chip below the field updates
+  // (otherwise the old "✗ recipient must be..." text from a prior
+  // typo lingers, or the field looks unvalidated).
+  el.dispatchEvent(new Event("input"));
   $("xfer-amount").focus();
 }
 
@@ -1576,29 +1671,39 @@ function renderEntityHeader(entityId, e) {
     wrap.appendChild(row("pubkey on chain",
       e.pubkey_registered ? "yes" : "no (revealed by first outgoing tx)"));
   }
-  // Action row
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  const tip = document.createElement("button");
-  tip.className = "primary";
-  tip.textContent = "💸 send tokens";
-  tip.addEventListener("click", () => {
-    closeModal();
-    prefillTip((e && e.address) || entityId);
-  });
-  actions.appendChild(tip);
-  const trustUp = document.createElement("button");
-  trustUp.textContent = "▲ trust";
-  trustUp.title = "react UP on this entity";
-  trustUp.addEventListener("click", () => reactUser(entityId, 1));
-  const trustDown = document.createElement("button");
-  trustDown.textContent = "▼ distrust";
-  trustDown.addEventListener("click", () => reactUser(entityId, 2));
-  if (!YOU || YOU.entity_id !== entityId) {
-    actions.appendChild(trustUp);
-    actions.appendChild(trustDown);
+  // Action row.  Every button here is a write op against /wallet/*,
+  // so they ALL gate on YOU being a loaded wallet (not read-only).
+  // Self-actions (trust/distrust on yourself, tipping yourself) are
+  // also hidden -- the chain rejects self-react and self-transfer,
+  // so showing the buttons would be a "click me, get a 502" bug.
+  const isWalletLoaded = YOU && YOU.mode !== "read-only";
+  const isSelf = isWalletLoaded && YOU.entity_id === entityId;
+  if (isWalletLoaded) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    if (!isSelf) {
+      const tip = document.createElement("button");
+      tip.className = "primary";
+      tip.textContent = "💸 send tokens";
+      tip.addEventListener("click", () => {
+        closeModal();
+        prefillTip((e && e.address) || entityId);
+      });
+      actions.appendChild(tip);
+      const trustUp = document.createElement("button");
+      trustUp.textContent = "▲ trust";
+      trustUp.title = "react UP on this entity";
+      trustUp.addEventListener("click", () => reactUser(entityId, 1));
+      const trustDown = document.createElement("button");
+      trustDown.textContent = "▼ distrust";
+      trustDown.addEventListener("click", () => reactUser(entityId, 2));
+      actions.appendChild(trustUp);
+      actions.appendChild(trustDown);
+    }
+    if (actions.children.length > 0) {
+      wrap.appendChild(actions);
+    }
   }
-  wrap.appendChild(actions);
   return wrap;
 }
 
@@ -1686,11 +1791,17 @@ async function refreshWallet() {
   a.textContent = me.address || me.entity_id || "—";
   a.onclick = () => copyToClipboard(me.address || me.entity_id || "");
   // First-spend pubkey auto-handling.  When pubkey isn't on chain
-  // yet, show the explanatory banner AND auto-tick the checkbox so
-  // the user doesn't need to know what it means -- their first
-  // outgoing transfer will register the pubkey by default.
+  // yet, show the explanatory banner AND auto-tick the checkbox.
+  // We auto-tick ONCE per "transition into needs-pubkey" rather than
+  // every refresh -- otherwise a user who manually unchecks the box
+  // would have it re-checked behind their back on the next refresh
+  // tick (a real bug observed on iter 3).  Same logic for the
+  // pubkey-registered transition: only flip the box once, not every
+  // refresh.
   let warn = $("wallet-pubkey-warn");
   const xferPk = $("xfer-pubkey");
+  const lastPubkeyState = xferPk.dataset.lastPubkeyState || "";
+  const currentState = me.pubkey_registered === false ? "needs" : "registered";
   if (me.pubkey_registered === false) {
     if (!warn) {
       warn = document.createElement("div");
@@ -1699,14 +1810,16 @@ async function refreshWallet() {
       warn.textContent =
         "Heads up: your pubkey isn't on chain yet.  The " +
         "“First-spend” box is auto-checked so your first outgoing " +
-        "transfer installs it.";
-      $("tab-wallet").querySelector(".panel:nth-child(2)").prepend(warn);
+        "transfer installs it (you can uncheck it if you know what " +
+        "you're doing).";
+      $("tab-wallet").querySelector(".panel:nth-child(3)").prepend(warn);
     }
-    xferPk.checked = true;
-  } else if (warn) {
-    warn.remove();
-    xferPk.checked = false;
+    if (lastPubkeyState !== "needs") xferPk.checked = true;
+  } else {
+    if (warn) warn.remove();
+    if (lastPubkeyState === "needs") xferPk.checked = false;
   }
+  xferPk.dataset.lastPubkeyState = currentState;
 }
 
 // Live shape-only validation of the recipient field.  Real checksum
@@ -1759,6 +1872,7 @@ $("xfer-submit").addEventListener("click", async () => {
   if (r.status === 200) {
     toast("Transfer sent: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
     $("xfer-to").value = "";
+    $("xfer-to").dispatchEvent(new Event("input"));  // clears stale validation chip
     $("xfer-amount").value = "";
     refreshWallet();
   } else {
@@ -1824,6 +1938,11 @@ async function castVote(approve, pidOverride) {
   });
   if (r.status === 200) {
     toast("Vote " + (approve ? "YES" : "NO") + " cast on " + shortHex(pid, 8, 6), "ok");
+    // Clear the manual proposal-id form once the vote landed -- a
+    // stale id sitting there after success looks like the action
+    // didn't take.  Refresh the list so the row re-renders with a
+    // "✓ voted" badge and the inline vote buttons hide.
+    if (!pidOverride) $("vote-pid").value = "";
     refreshProposals();
   } else {
     toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
