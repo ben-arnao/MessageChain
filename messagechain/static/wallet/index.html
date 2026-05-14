@@ -172,7 +172,6 @@
     padding: 0.9rem;
     margin-bottom: 1rem;
   }
-  .composer.is-reply { border-color: var(--accent); }
   .composer .row {
     display: flex;
     gap: 0.5rem;
@@ -189,17 +188,6 @@
     color: var(--muted);
     font-size: 0.85rem;
     margin-top: 0.4rem;
-  }
-  .composer .reply-to {
-    color: var(--muted);
-    font-size: 0.8rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    margin-bottom: 0.5rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px dashed var(--border);
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
   }
   .composer .poll-options {
     display: none;
@@ -499,10 +487,10 @@
     <span id="you-mode" class="pill">loading…</span>
     <span id="you-id" class="you-id" title="Click to copy your address"></span>
     <span class="grow"></span>
-    <span id="you-balance" class="pill"></span>
-    <span id="you-stake" class="pill"></span>
-    <span id="you-sigs" class="pill"></span>
-    <span id="you-chain" class="pill"></span>
+    <span id="you-balance" class="pill" title="your token balance on chain"></span>
+    <span id="you-stake" class="pill" title="your staked tokens"></span>
+    <span id="you-sigs" class="pill" title="WOTS+ one-time signatures left on your current key tree (rotate-key to refresh)"></span>
+    <span id="you-chain" class="pill" title="current chain height (read from your local validator's RPC)"></span>
   </div>
   <nav class="tabs">
     <button data-tab="feed" class="active">Feed</button>
@@ -518,12 +506,7 @@
 <!-- ============================================================== Feed -->
 <section class="tab-panel active" id="tab-feed">
   <div class="composer" id="composer">
-    <div class="reply-to" id="composer-reply-to" style="display:none;">
-      <span>↳ replying to <span id="composer-reply-target"></span></span>
-      <span class="grow"></span>
-      <button class="ghost" id="composer-cancel-reply">cancel</button>
-    </div>
-    <textarea id="composer-text" placeholder="What's on your mind?"></textarea>
+    <textarea id="composer-text" placeholder="What's on your mind?  (Cmd/Ctrl+Enter to post)"></textarea>
     <div class="row">
       <label>/c/<input id="composer-community" type="text" placeholder="community (optional)" style="max-width: 11rem;"></label>
       <label class="hint">
@@ -786,6 +769,14 @@ function switchTab(name) {
     b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach(p =>
     p.classList.toggle("active", p.id === "tab-" + name));
+  // Sync to URL hash so refresh / shared link keeps the tab.  Don't
+  // clobber a #tx-... permalink (the feed tab handles those).
+  if (name !== "feed" || !window.location.hash.startsWith("#tx-")) {
+    const newHash = name === "feed" ? "" : "#" + name;
+    if (newHash !== window.location.hash) {
+      window.history.replaceState({}, "", window.location.pathname + window.location.search + newHash);
+    }
+  }
   if (name === "wallet") refreshWallet();
   if (name === "node") refreshNode();
   if (name === "identity") refreshIdentity();
@@ -818,8 +809,12 @@ async function refreshMe() {
       youMode.className = "pill ok";
       const idEl = $("you-id");
       idEl.textContent = shortAddr(m.address || ("mc1?" + m.entity_id));
-      idEl.title = "click to copy: " + (m.address || m.entity_id);
-      idEl.onclick = () => copyToClipboard(m.address || m.entity_id);
+      idEl.title = "open your profile (right-click to copy address)";
+      idEl.onclick = () => openProfileModal(m.entity_id);
+      idEl.oncontextmenu = e => {
+        e.preventDefault();
+        copyToClipboard(m.address || m.entity_id);
+      };
       if (m.balance != null) $("you-balance").textContent = m.balance + " bal";
       if (m.stake != null && m.stake > 0) $("you-stake").textContent = m.stake + " stake";
       if (m.sigs_remaining != null) {
@@ -861,11 +856,7 @@ const composerText = $("composer-text");
 const composerMeta = $("composer-meta");
 const composerPost = $("composer-post");
 const composerCommunity = $("composer-community");
-const composerReplyTo = $("composer-reply-to");
-const composerReplyTarget = $("composer-reply-target");
-const composerCancelReply = $("composer-cancel-reply");
 const composerPollToggle = $("composer-poll-toggle");
-let composerReplyHash = null;  // tx_hash of message we're replying to (set by per-card Reply)
 
 function utf8Bytes(s) { return new TextEncoder().encode(s).length; }
 
@@ -874,9 +865,25 @@ async function updateComposerMeta() {
   const text = composerText.value;
   const bytes = utf8Bytes(text);
   let line = bytes + " bytes";
-  composerPost.disabled = text.trim().length === 0;
+  // Base disable: empty text always disables.
+  let disabled = text.trim().length === 0;
+  // Poll-mode validation: at least 2 non-empty options required.
+  if (composerPollToggle.checked) {
+    const opts = [1, 2, 3, 4]
+      .map(i => $("composer-poll-" + i).value.trim())
+      .filter(s => s.length > 0);
+    if (opts.length < 2) {
+      disabled = true;
+      line = bytes + " bytes  ·  poll needs at least 2 options";
+    } else {
+      line = bytes + " bytes  ·  " + opts.length + " poll options";
+    }
+  }
+  composerPost.disabled = disabled;
   composerMeta.textContent = line;
-  if (bytes > 0 && bytes !== _lastFeeBytes) {
+  // Skip fee preview while in poll-mode (the chain charges proposal-
+  // style for polls; the message-tx estimate would be misleading).
+  if (!composerPollToggle.checked && bytes > 0 && bytes !== _lastFeeBytes) {
     _lastFeeBytes = bytes;
     try {
       const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
@@ -888,12 +895,56 @@ async function updateComposerMeta() {
   }
 }
 composerText.addEventListener("input", updateComposerMeta);
+composerText.addEventListener("input", saveComposerDraft);
+composerCommunity.addEventListener("input", saveComposerDraft);
+[1, 2, 3, 4].forEach(i => {
+  $("composer-poll-" + i).addEventListener("input", saveComposerDraft);
+});
 composerText.addEventListener("keydown", e => {
   // Cmd/Ctrl+Enter to post.
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !composerPost.disabled) {
     composerPost.click();
   }
 });
+
+// --- Composer draft persistence ---
+// A typed-but-unsubmitted post survives a page refresh, an accidental
+// Esc, or a chain-reject toast (where we want the user to be able to
+// edit + retry without re-typing).  Stored in localStorage so it
+// crosses tab-restart too; cleared on a successful post.
+const COMPOSER_DRAFT_KEY = "mc.wallet.composer-draft";
+function saveComposerDraft() {
+  try {
+    localStorage.setItem(COMPOSER_DRAFT_KEY, JSON.stringify({
+      text: composerText.value,
+      community: composerCommunity.value,
+      poll: composerPollToggle.checked,
+      poll_options: [1, 2, 3, 4].map(i => $("composer-poll-" + i).value),
+    }));
+  } catch (_) {}
+}
+function restoreComposerDraft() {
+  try {
+    const raw = localStorage.getItem(COMPOSER_DRAFT_KEY);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    if (d.text) composerText.value = d.text;
+    if (d.community) composerCommunity.value = d.community;
+    if (d.poll) {
+      composerPollToggle.checked = true;
+      composerPollToggle.dispatchEvent(new Event("change"));
+      [1, 2, 3, 4].forEach((i, idx) => {
+        if (d.poll_options && d.poll_options[idx]) {
+          $("composer-poll-" + i).value = d.poll_options[idx];
+        }
+      });
+    }
+    updateComposerMeta();
+  } catch (_) {}
+}
+function clearComposerDraft() {
+  try { localStorage.removeItem(COMPOSER_DRAFT_KEY); } catch (_) {}
+}
 
 composerPollToggle.addEventListener("change", () => {
   const on = composerPollToggle.checked;
@@ -902,28 +953,15 @@ composerPollToggle.addEventListener("change", () => {
     ? "What's the question?  (Cmd/Ctrl+Enter to open the poll)"
     : "What's on your mind?  (Cmd/Ctrl+Enter to post)";
   composerPost.textContent = on ? "Open poll" : "Post";
+  updateComposerMeta();
+  saveComposerDraft();
 });
-
-composerCancelReply.addEventListener("click", () => {
-  composerReplyHash = null;
-  composerReplyTo.style.display = "none";
-});
-
-function startReplyAt(tx_hash) {
-  composerReplyHash = tx_hash;
-  composerReplyTarget.textContent = shortHex(tx_hash, 10, 6);
-  composerReplyTarget.title = tx_hash;
-  composerReplyTo.style.display = "flex";
-  composerText.focus();
-  window.scrollTo({ top: 0, behavior: "smooth" });
-}
 
 composerPost.addEventListener("click", async () => {
   const text = composerText.value.trim();
   if (!text) return;
   const fee = await liveFee(utf8Bytes(text));
   const body = { message: text, fee: fee };
-  if (composerReplyHash) body.prev = composerReplyHash;
   if (composerCommunity.value.trim()) body.community_id = composerCommunity.value.trim();
   if (composerPollToggle.checked) {
     const opts = [1, 2, 3, 4]
@@ -947,18 +985,19 @@ composerPost.addEventListener("click", async () => {
       toast("Posted: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
       composerText.value = "";
       composerCommunity.value = "";
-      composerReplyHash = null;
-      composerReplyTo.style.display = "none";
       if (composerPollToggle.checked) {
         composerPollToggle.checked = false;
-        composer.classList.remove("poll-mode");
+        composerPollToggle.dispatchEvent(new Event("change"));
         [1, 2, 3, 4].forEach(i => { $("composer-poll-" + i).value = ""; });
       }
       _lastFeeBytes = -1;
+      clearComposerDraft();
       updateComposerMeta();
       forceFeedRefresh(r.data.result.tx_hash);
       refreshMe();
     } else {
+      // Leave the composer text alone so the user can edit + retry.
+      // The draft auto-save preserves it across a refresh too.
       toast("Send failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
     }
   } finally {
@@ -1010,6 +1049,40 @@ function setCommunityFilter(name) {
   refreshFeed();
 }
 
+// Snapshot any open inline-reply forms before a feed re-render.
+// Without this, refreshing the feed (manual click of the new-activity
+// pill, periodic background poll, post-action force-refresh) would
+// blow away the user's typed-but-unsubmitted reply text -- a real
+// usability bug, not just a polish nit.
+function snapshotInlineReplies() {
+  const state = {};
+  document.querySelectorAll(".inline-reply.open").forEach(el => {
+    const card = el.closest(".msg");
+    const txHash = card && card.id ? card.id.replace(/^tx-/, "") : null;
+    if (txHash) {
+      const ta = el.querySelector("textarea");
+      state[txHash] = { text: ta ? ta.value : "" };
+    }
+  });
+  return state;
+}
+function restoreInlineReplies(state) {
+  Object.keys(state).forEach(txHash => {
+    const card = document.getElementById("tx-" + txHash);
+    if (!card) return;
+    const reply = card.querySelector(".inline-reply");
+    if (!reply) return;
+    reply.classList.add("open");
+    const ta = reply.querySelector("textarea");
+    if (ta) {
+      ta.value = state[txHash].text;
+      // Re-fire the input event so the byte count + post button
+      // enable/disable state reflect the restored text.
+      ta.dispatchEvent(new Event("input"));
+    }
+  });
+}
+
 async function refreshFeed() {
   const list = $("feed-list");
   const empty = $("feed-empty");
@@ -1042,10 +1115,12 @@ async function refreshFeed() {
       return;
     }
     empty.style.display = "none";
+    const replyState = snapshotInlineReplies();
     list.innerHTML = "";
     // Always render against the FULL window so vote-on-poll cross-
     // references resolve even if the poll itself is filtered out.
     msgs.forEach(m => list.appendChild(renderMessageCard(m, allMsgs)));
+    restoreInlineReplies(replyState);
     // Honor URL-hash deep link if any.
     if (window.location.hash.startsWith("#tx-")) {
       const t = document.querySelector(window.location.hash);
@@ -1550,6 +1625,22 @@ $("modal-backdrop").addEventListener("click", e => {
 });
 window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
 
+// 'n' anywhere outside an input/textarea jumps to the composer.
+// Twitter / Reddit / GitHub all use a one-letter "new" hotkey; same
+// affordance here, with a guard so it doesn't eat keystrokes inside
+// the composer itself.
+window.addEventListener("keydown", e => {
+  if (e.key !== "n") return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea") return;
+  if ($("modal-backdrop").classList.contains("open")) return;
+  e.preventDefault();
+  switchTab("feed");
+  composerText.focus();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
 // Custom confirm using the same modal slot.  Avoids the native
 // confirm() dialog which (a) is jarring against the dark UI, and
 // (b) hides behind the browser tab in some configurations.
@@ -1972,6 +2063,14 @@ async function refreshNode() {
   }
   await Promise.all([refreshMe(), refreshChainStatus()]);
   await refreshFeed();
+  // Restore any in-flight composer draft (typed text that survived a
+  // refresh / accidental Esc / chain-reject).  Done AFTER the first
+  // refresh so the textarea isn't blanked by the meta-line update.
+  restoreComposerDraft();
+  // Restore tab from URL hash if present (e.g. #wallet, #governance).
+  const hash = window.location.hash;
+  const tabMatch = hash.match(/^#(feed|wallet|governance|identity|node)$/);
+  if (tabMatch) switchTab(tabMatch[1]);
   setInterval(refreshChainStatus, 8000);
   setInterval(pollNewActivity, 12000);
   setInterval(refreshMe, 25000);
