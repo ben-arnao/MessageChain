@@ -148,6 +148,35 @@
   }
   .messages-list .msg-card .votes.pos { color: var(--pos); }
   .messages-list .msg-card .votes.neg { color: var(--neg); }
+  .messages-list .msg-card .votes.expandable { cursor: pointer; }
+  .messages-list .msg-card .weighted {
+    margin-top: 0.3rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: none;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.2rem 0.7rem;
+    border-top: 1px dashed var(--border);
+    padding-top: 0.25rem;
+  }
+  .messages-list .msg-card .weighted.open { display: grid; }
+  .messages-list .msg-card .weighted .axis-label { color: var(--muted); }
+  .messages-list .msg-card .weighted .axis-val { color: var(--fg); }
+  .stat.expandable { cursor: pointer; }
+  .stat .weighted {
+    display: none;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 0.4rem;
+    padding-top: 0.3rem;
+    border-top: 1px dashed var(--border);
+    grid-template-columns: 1fr;
+    gap: 0.15rem;
+  }
+  .stat .weighted.open { display: grid; }
+  .stat .weighted .axis-val { color: var(--fg); }
   .messages-list .empty {
     color: var(--muted);
     font-size: 0.85rem;
@@ -332,7 +361,7 @@
     if (sr) sr.textContent = "";
   }
 
-  function addStat(gridId, label, value, sub, valueClass) {
+  function addStat(gridId, label, value, sub, valueClass, weightedRates) {
     const card = document.createElement("div");
     card.className = "stat";
     const l = document.createElement("div");
@@ -349,7 +378,44 @@
       s.textContent = sub;
       card.appendChild(s);
     }
+    // Weighted-rates disclosure: click the card to reveal the four
+    // L2-style weighted ratios (balance / spend / age / age*spend).
+    // Per guides/reputation.md these are indexer-layer signals shown
+    // alongside the simple rate, never replacing it.
+    if (weightedRates) {
+      card.classList.add("expandable");
+      const wbox = renderWeightedRates(weightedRates);
+      card.appendChild(wbox);
+      card.addEventListener("click", () => {
+        wbox.classList.toggle("open");
+      });
+    }
     document.getElementById(gridId).appendChild(card);
+  }
+
+  const WEIGHTED_AXES = [
+    { key: "by_balance_pct", label: "balance" },
+    { key: "by_spend_pct",   label: "spend" },
+    { key: "by_age_pct",     label: "age" },
+    { key: "by_rep_pct",     label: "rep (age × spend)" },
+  ];
+  function renderWeightedRates(wr) {
+    const box = document.createElement("div");
+    box.className = "weighted";
+    for (const axis of WEIGHTED_AXES) {
+      const row = document.createElement("div");
+      const lbl = document.createElement("span");
+      lbl.className = "axis-label";
+      lbl.textContent = axis.label + ": ";
+      const val = document.createElement("span");
+      val.className = "axis-val";
+      const v = wr ? wr[axis.key] : null;
+      val.textContent = (typeof v === "number") ? v.toFixed(0) + "% up" : "—";
+      row.appendChild(lbl);
+      row.appendChild(val);
+      box.appendChild(row);
+    }
+    return box;
   }
 
   function signClass(n) {
@@ -424,7 +490,8 @@
       typeof rep.rate_pct === "number"
         ? fmtPct(rep.rate_pct) + " up · -" + rep.downs_received + " down"
         : "no votes yet",
-      signClass(rep.score));
+      signClass(rep.score),
+      rep.weighted_rates);
     const ps = profile.post_score;
     addStat("reputationGrid",
       "Distinct post upvoters",
@@ -433,7 +500,8 @@
         ? fmtPct(ps.rate_pct) + " up · " + ps.ups_received + "/+ "
           + ps.downs_received + "/- across all posts"
         : "no post votes yet",
-      signClass(ps.total));
+      signClass(ps.total),
+      ps.weighted_rates);
     addStat("reputationGrid", "Reactions cast", fmtInt(profile.reactions_cast));
 
     // Governance
@@ -497,7 +565,9 @@
         meta.appendChild(comm);
       }
 
-      // Vote summary if present.
+      // Vote summary if present.  Mirrors the feed card's expandable
+      // pattern: when weighted_rates is attached, click reveals the
+      // four indexer-layer weighted ratios beneath the meta row.
       if (
         typeof m.ups === "number" && typeof m.downs === "number"
         && (m.ups + m.downs) > 0
@@ -510,6 +580,16 @@
           + (typeof m.up_pct === "number"
               ? " · " + fmtPct(m.up_pct) + " up" : "");
         meta.appendChild(v);
+        if (m.weighted_rates) {
+          v.classList.add("expandable");
+          v.textContent += " · ▾";
+          const wbox = renderWeightedRates(m.weighted_rates);
+          card.appendChild(wbox);
+          v.addEventListener("click", (e) => {
+            e.stopPropagation();
+            wbox.classList.toggle("open");
+          });
+        }
       }
 
       // Optional reply-thread pointer.

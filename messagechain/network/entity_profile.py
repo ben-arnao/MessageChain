@@ -27,6 +27,10 @@ from messagechain.core.reaction import (
     REACT_CHOICE_DOWN,
     REACT_CHOICE_UP,
 )
+from messagechain.core.vote_weights import (
+    compute_vote_weight_snapshots,
+    weighted_up_rates,
+)
 
 
 def _rate_pct(ups: int, downs: int) -> Optional[float]:
@@ -190,12 +194,16 @@ def compute_entity_profile(blockchain, entity_id: bytes) -> dict:
     reputation_score = rs.user_trust_score(eid)
     rep_ups = 0
     rep_downs = 0
-    for (_voter, target, target_is_user), choice in rs.choices.items():
+    rep_weighted_inputs: list[tuple[int, dict]] = []
+    for (voter, target, target_is_user), choice in rs.choices.items():
         if target_is_user and target == eid:
             if choice == REACT_CHOICE_UP:
                 rep_ups += 1
             elif choice == REACT_CHOICE_DOWN:
                 rep_downs += 1
+            else:
+                continue
+            rep_weighted_inputs.append((voter, choice, target, target_is_user))
 
     # ── post score: UP/DOWN votes received on this user's messages ──
     user_msg_set = set(user_msg_tx_hashes)
@@ -203,6 +211,7 @@ def compute_entity_profile(blockchain, entity_id: bytes) -> dict:
     post_ups = 0
     post_downs = 0
     distinct_post_upvoters: set[bytes] = set()
+    post_weighted_inputs: list[tuple[int, dict]] = []
     for (voter, target, target_is_user), choice in rs.choices.items():
         if not target_is_user and target in user_msg_set:
             if choice == REACT_CHOICE_UP:
@@ -212,6 +221,30 @@ def compute_entity_profile(blockchain, entity_id: bytes) -> dict:
             elif choice == REACT_CHOICE_DOWN:
                 post_score -= 1
                 post_downs += 1
+            else:
+                continue
+            post_weighted_inputs.append((voter, choice, target, target_is_user))
+
+    # Compute the four weighted ratios for both sections — display-only
+    # L2-style weighting per guides/reputation.md ("stake-weighted",
+    # "skin-in-the-game amplification" etc.).  Done in one chain-walk
+    # pass via compute_vote_weight_snapshots and reused for both
+    # reputation (user-trust votes) and post_score (message votes).
+    if rep_weighted_inputs or post_weighted_inputs:
+        snapshots = compute_vote_weight_snapshots(blockchain)
+    else:
+        snapshots = {}
+
+    def _resolve(inputs):
+        resolved = []
+        for voter, choice, target, target_is_user in inputs:
+            snap = snapshots.get((voter, target, target_is_user))
+            if snap is not None:
+                resolved.append((choice, snap))
+        return resolved
+
+    rep_weighted_rates = weighted_up_rates(_resolve(rep_weighted_inputs))
+    post_weighted_rates = weighted_up_rates(_resolve(post_weighted_inputs))
 
     # Existence check: an entity is "real" if anything on chain
     # references it, or if it carries on-chain state.
@@ -248,6 +281,7 @@ def compute_entity_profile(blockchain, entity_id: bytes) -> dict:
             "ups_received": rep_ups,
             "downs_received": rep_downs,
             "rate_pct": _rate_pct(rep_ups, rep_downs),
+            "weighted_rates": rep_weighted_rates,
         },
         "post_score": {
             "total": post_score,
@@ -255,6 +289,7 @@ def compute_entity_profile(blockchain, entity_id: bytes) -> dict:
             "downs_received": post_downs,
             "distinct_upvoters": len(distinct_post_upvoters),
             "rate_pct": _rate_pct(post_ups, post_downs),
+            "weighted_rates": post_weighted_rates,
         },
         "rewards": {
             "blocks_proposed": blocks_proposed,

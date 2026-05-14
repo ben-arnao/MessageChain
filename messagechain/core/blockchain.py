@@ -17759,6 +17759,10 @@ class Blockchain:
             REACT_CHOICE_UP as _UP,
             REACT_CHOICE_DOWN as _DOWN,
         )
+        from messagechain.core.vote_weights import (
+            compute_message_weighted_rates_map,
+            compute_vote_weight_snapshots,
+        )
         msg_votes: dict[bytes, list[int]] = {}  # tx_hash -> [ups, downs]
         for (_voter, target, target_is_user), choice in (
             self.reaction_state.choices.items()
@@ -17770,6 +17774,16 @@ class Blockchain:
                 counts[0] += 1
             elif choice == _DOWN:
                 counts[1] += 1
+
+        # Per-message weighted-up-rate map for the four display-layer
+        # axes (balance / spend / age / age*spend).  Computed once over
+        # the whole chain so each message in the feed gets its weighted
+        # surface without a second walk.  Per guides/reputation.md this
+        # is an indexer-layer convenience, not a consensus value.
+        msg_weighted = compute_message_weighted_rates_map(
+            self.reaction_state,
+            compute_vote_weight_snapshots(self),
+        )
 
         messages = []
         for block in reversed(self.chain):
@@ -17786,6 +17800,9 @@ class Blockchain:
                     "downs": downs,
                     "up_pct": (100.0 * ups / total) if total > 0 else None,
                 }
+                wr = msg_weighted.get(tx.tx_hash)
+                if wr is not None:
+                    entry["weighted_rates"] = wr
                 prev = getattr(tx, "prev", None)
                 if prev is not None:
                     entry["prev"] = prev.hex()
@@ -17831,6 +17848,10 @@ class Blockchain:
             REACT_CHOICE_UP as _UP,
             REACT_CHOICE_DOWN as _DOWN,
         )
+        from messagechain.core.vote_weights import (
+            compute_message_weighted_rates_map,
+            compute_vote_weight_snapshots,
+        )
         msg_votes: dict[bytes, list[int]] = {}
         for (_voter, target, target_is_user), choice in (
             self.reaction_state.choices.items()
@@ -17842,6 +17863,13 @@ class Blockchain:
                 counts[0] += 1
             elif choice == _DOWN:
                 counts[1] += 1
+
+        # Per-message weighted-up-rate map — same display-layer surface
+        # the global feed exposes, scoped here to the entity's own posts.
+        msg_weighted = compute_message_weighted_rates_map(
+            self.reaction_state,
+            compute_vote_weight_snapshots(self),
+        )
 
         messages: list[dict] = []
         for block in reversed(self.chain):
@@ -17860,6 +17888,9 @@ class Blockchain:
                     "downs": downs,
                     "up_pct": (100.0 * ups / total) if total > 0 else None,
                 }
+                wr = msg_weighted.get(tx.tx_hash)
+                if wr is not None:
+                    entry["weighted_rates"] = wr
                 prev = getattr(tx, "prev", None)
                 if prev is not None:
                     entry["prev"] = prev.hex()

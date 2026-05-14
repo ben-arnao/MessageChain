@@ -208,6 +208,22 @@
   @media (prefers-color-scheme: dark) {
     .msg .votes .down { color: #e88; }
   }
+  .msg .votes.expandable { cursor: pointer; }
+  .msg .votes.expandable .hint { color: var(--muted); }
+  .msg .weighted {
+    margin-top: 0.35rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: none;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.25rem 0.7rem;
+    border-top: 1px dashed var(--border);
+    padding-top: 0.3rem;
+  }
+  .msg .weighted.open { display: grid; }
+  .msg .weighted .axis-label { color: var(--muted); }
+  .msg .weighted .axis-val { color: var(--fg); }
   .msg .text {
     white-space: pre-wrap;
     word-wrap: break-word;
@@ -813,6 +829,36 @@
     return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
   }
 
+  // Four weighted-up-rate axes returned by the server's vote_weights
+  // aggregator.  Order is fixed so the disclosure layout is predictable
+  // across cards.  Labels mirror the user-facing concept, not the JSON
+  // key — `by_rep_pct` is exposed as "reputation (age × spend)" since
+  // the placeholder is a product of the two prior axes.
+  const WEIGHTED_AXES = [
+    { key: "by_balance_pct", label: "balance" },
+    { key: "by_spend_pct",   label: "spend" },
+    { key: "by_age_pct",     label: "age" },
+    { key: "by_rep_pct",     label: "rep (age × spend)" },
+  ];
+  function renderWeightedRates(wr) {
+    const box = document.createElement("div");
+    box.className = "weighted";
+    for (const axis of WEIGHTED_AXES) {
+      const row = document.createElement("div");
+      const lbl = document.createElement("span");
+      lbl.className = "axis-label";
+      lbl.textContent = axis.label + ": ";
+      const val = document.createElement("span");
+      val.className = "axis-val";
+      const v = wr ? wr[axis.key] : null;
+      val.textContent = (typeof v === "number") ? v.toFixed(0) + "% up" : "—";
+      row.appendChild(lbl);
+      row.appendChild(val);
+      box.appendChild(row);
+    }
+    return box;
+  }
+
   function renderMessage(m, knownHashes, hashToAuthor) {
     const card = document.createElement("div");
     card.className = "msg";
@@ -984,7 +1030,13 @@
     card.appendChild(text);
 
     // Vote indicator: ▲N · ▼N · NN% up.  Hidden entirely when the
-    // message has no votes yet so the feed stays uncluttered.
+    // message has no votes yet so the feed stays uncluttered.  When
+    // the server returned weighted_rates the indicator becomes a
+    // click-to-expand surface that reveals the four display-layer
+    // weighted ratios (balance / spend / age / age*spend) — per
+    // guides/reputation.md these are indexer-layer signals, never
+    // canonical, shown alongside the simple ratio rather than
+    // replacing it.
     const ups = m.ups || 0;
     const downs = m.downs || 0;
     if (ups + downs > 0) {
@@ -1003,6 +1055,19 @@
       votes.appendChild(d);
       votes.appendChild(pct);
       card.appendChild(votes);
+      if (m.weighted_rates) {
+        votes.classList.add("expandable");
+        const hint = document.createElement("span");
+        hint.className = "hint";
+        hint.textContent = "▾ weighted";
+        votes.appendChild(hint);
+        const weighted = renderWeightedRates(m.weighted_rates);
+        card.appendChild(weighted);
+        votes.addEventListener("click", () => {
+          const open = weighted.classList.toggle("open");
+          hint.textContent = (open ? "▴" : "▾") + " weighted";
+        });
+      }
     }
     // Bottom-right card footer — only emitted when the message
     // carries a community handle.  Click filters the feed via the
