@@ -247,6 +247,8 @@
     align-items: center;
   }
   .msg .actions button { padding: 0.2rem 0.55rem; font-size: 0.85rem; }
+  .msg .actions .grow { flex-grow: 1; }
+  .msg .actions .permalink-btn { color: var(--muted); font-size: 0.8rem; }
   .msg .react-counts { color: var(--muted); font-size: 0.8rem; margin-right: 0.3rem; }
   .msg .react-counts .up { color: var(--accent); }
   .msg .react-counts .down { color: var(--error); }
@@ -314,44 +316,26 @@
     margin-top: 0.4rem;
   }
   .msg.is-reply { margin-bottom: 0.4rem; }
-  /* Inline poll-vote summary: collapsed by default, click to expand. */
-  .poll-vote-summary {
-    margin-top: 0.5rem;
-    padding-top: 0.5rem;
-    border-top: 1px dashed var(--border);
-    font-size: 0.85rem;
+  .reply-toggle {
     color: var(--muted);
-  }
-  .poll-vote-summary .toggle {
-    background: transparent;
-    border: none;
-    padding: 0;
-    color: var(--accent);
-    cursor: pointer;
-    font: inherit;
-  }
-  .poll-vote-summary .toggle:hover { text-decoration: underline; }
-  .poll-vote-list {
-    display: none;
+    font-size: 0.8rem;
     margin-top: 0.4rem;
-    padding-left: 0.6rem;
-    border-left: 2px dashed var(--border);
   }
-  .poll-vote-summary.open .poll-vote-list { display: block; }
-  .poll-vote-row {
+  .msg .poll-result-row {
     display: flex;
+    align-items: center;
     gap: 0.5rem;
-    align-items: baseline;
-    padding: 0.15rem 0;
+    padding: 0.4rem 0.7rem;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    border-radius: 4px;
+  }
+  .msg .poll-result-row + .poll-result-row { margin-top: 0.3rem; }
+  .msg .poll-result-row .opt-tally {
+    margin-left: auto;
     color: var(--muted);
     font-size: 0.85rem;
   }
-  .poll-vote-row .voter {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    color: var(--fg);
-    cursor: pointer;
-  }
-  .poll-vote-row .voter:hover { text-decoration: underline; }
   /* Reputation badge in profile modal. */
   .rep-badge {
     display: inline-flex;
@@ -1059,8 +1043,14 @@ async function updateComposerMeta() {
     try {
       const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
       if (r.status === 200 && r.data && r.data.result) {
-        const fee = r.data.result.fee_estimate;
-        composerMeta.textContent = bytes + " bytes  ·  ~" + fee + " token fee";
+        // Unified RPC returns ``recommended_fee``; legacy field name
+        // ``fee_estimate`` kept as fallback for in-flight server upgrades.
+        const result = r.data.result;
+        const fee = result.recommended_fee || result.fee_estimate;
+        if (fee != null) {
+          composerMeta.textContent =
+            bytes + " bytes  ·  ~" + fee + " token fee";
+        }
       }
     } catch (_) {}
   }
@@ -1493,28 +1483,20 @@ function forceFeedRefresh(myNewTxHash) {
 
 // Group the visible message window into a threaded structure.
 //   * `replies`: tx_hash -> [child reply messages]
-//   * `pollVotes`: poll_tx_hash -> [vote messages targeting that poll]
 //   * `tops`: messages that should render at the root level
 //
-// A reply nests when its `prev` resolves to a visible parent.  A vote
-// always folds under its target poll (visible or not -- the chain
-// always knows the poll exists; if it isn't in our window, the vote
-// just doesn't render top-level either, matching the user's "auto-
-// display polls and threads instead of as their own separate txs"
-// directive).
+// A reply nests when its `prev` resolves to a visible parent.  Votes
+// are filtered out of the top-level feed entirely (renderPollResults
+// computes the per-option tally directly off `allMsgs`); they never
+// render as their own card.
 function buildThreadedView(allMsgs) {
   const byHash = new Map();
   allMsgs.forEach(m => byHash.set(m.tx_hash, m));
   const replies = new Map();
-  const pollVotes = new Map();
   const isReply = new Set();
   const isVote = new Set();
   for (const m of allMsgs) {
     if (m.kind === "vote" && m.vote_target && m.vote_target.poll_txid) {
-      const k = m.vote_target.poll_txid;
-      const list = pollVotes.get(k) || [];
-      list.push(m);
-      pollVotes.set(k, list);
       isVote.add(m.tx_hash);
       continue;
     }
@@ -1532,9 +1514,7 @@ function buildThreadedView(allMsgs) {
   // top-level newest sort -- threads always read newest-leaf-first).
   replies.forEach(arr =>
     arr.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)));
-  pollVotes.forEach(arr =>
-    arr.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)));
-  return { tops, replies, pollVotes };
+  return { tops, replies };
 }
 
 // Render a top-level card and recursively its reply children.  Depth
@@ -1544,81 +1524,84 @@ function buildThreadedView(allMsgs) {
 function renderThreadedCard(m, allMsgs, threaded, depth) {
   const card = renderMessageCard(m, allMsgs);
   if (depth > 0) card.classList.add("is-reply");
-  // Inline poll-vote summary (collapsed by default).
-  if (m.kind === "poll") {
-    const votes = threaded.pollVotes.get(m.tx_hash) || [];
-    if (votes.length > 0) {
-      card.appendChild(renderPollVoteSummary(m, votes, allMsgs));
-    }
-  }
-  // Recurse into replies.
+  // Recurse into replies, but render them collapsed by default --
+  // Reddit-style "show N replies" toggle that the user explicitly
+  // expands when they want to drill into the thread.  Avoids drowning
+  // a tall feed in nested replies on first paint.
   const kids = threaded.replies.get(m.tx_hash);
   if (kids && kids.length > 0) {
+    const total = countReplies(kids, threaded);
+    const toggle = document.createElement("button");
+    toggle.className = "ghost reply-toggle";
+    toggle.textContent =
+      "▸ show " + total + " repl" + (total === 1 ? "y" : "ies");
     const wrap = document.createElement("div");
     wrap.className = "replies";
+    wrap.style.display = "none";
     kids.forEach(k =>
       wrap.appendChild(renderThreadedCard(k, allMsgs, threaded, depth + 1)));
+    toggle.addEventListener("click", () => {
+      const open = wrap.style.display === "none";
+      wrap.style.display = open ? "" : "none";
+      toggle.textContent =
+        (open ? "▾ hide " : "▸ show ") + total +
+        " repl" + (total === 1 ? "y" : "ies");
+    });
+    card.appendChild(toggle);
     card.appendChild(wrap);
   }
   return card;
 }
 
-function renderPollVoteSummary(poll, votes, allMsgs) {
-  // Tally + collapsible voter list.  Reads option text from the
-  // poll's poll_options so the summary is human-readable without
-  // a per-vote chain lookup.
-  const summary = document.createElement("div");
-  summary.className = "poll-vote-summary";
-  const counts = (poll.poll_options || []).map((opt, idx) => ({
-    idx, text: opt,
-    count: votes.filter(v => v.vote_target && v.vote_target.option_index === idx).length,
-  }));
-  const total = votes.length;
-  const top = document.createElement("div");
-  const toggle = document.createElement("button");
-  toggle.className = "toggle";
-  toggle.textContent = total + " vote" + (total === 1 ? "" : "s") + "  ▾";
-  toggle.addEventListener("click", () => {
-    const open = summary.classList.toggle("open");
-    toggle.textContent = total + " vote" + (total === 1 ? "" : "s") +
-      (open ? "  ▴" : "  ▾");
+// Count direct + transitive reply descendants -- used by the collapsed
+// reply toggle so the label reads "show 7 replies", not "show 3" when
+// the visible subtree actually has more nested below.
+function countReplies(kids, threaded) {
+  let n = 0;
+  kids.forEach(k => {
+    n += 1;
+    const sub = threaded.replies.get(k.tx_hash);
+    if (sub && sub.length > 0) n += countReplies(sub, threaded);
   });
-  top.appendChild(toggle);
-  // Inline tally summary (always visible).
-  const tally = document.createElement("span");
-  tally.style.marginLeft = "0.5rem";
-  tally.textContent = counts
-    .filter(c => c.count > 0)
-    .map(c => '"' + c.text + '" ' + c.count)
-    .join("  ·  ");
-  if (tally.textContent) top.appendChild(tally);
-  summary.appendChild(top);
-  // Expanded per-voter list.
+  return n;
+}
+
+// Render the poll's tally as a stack of per-option rows with vote
+// counts + percentage bars.  Used in place of the clickable option
+// buttons once the user has voted (or when they cannot vote -- own
+// poll / read-only mode).
+function renderPollResults(poll, allMsgs) {
   const list = document.createElement("div");
-  list.className = "poll-vote-list";
-  votes.forEach(v => {
+  list.className = "poll-options-list";
+  const opts = poll.poll_options || [];
+  const counts = opts.map((opt, idx) => ({
+    idx, text: opt,
+    count: (allMsgs || []).filter(x =>
+      x.kind === "vote" && x.vote_target &&
+      x.vote_target.poll_txid === poll.tx_hash &&
+      x.vote_target.option_index === idx
+    ).length,
+  }));
+  const total = counts.reduce((acc, c) => acc + c.count, 0);
+  counts.forEach(c => {
     const row = document.createElement("div");
-    row.className = "poll-vote-row";
-    const voter = document.createElement("span");
-    voter.className = "voter";
-    voter.title = v.entity_id || "";
-    voter.textContent = (YOU && YOU.entity_id === v.entity_id)
-      ? "you" : shortHex(v.entity_id, 8, 4);
-    voter.addEventListener("click", () => openProfileModal(v.entity_id));
-    const what = document.createElement("span");
-    const idx = v.vote_target && v.vote_target.option_index;
-    const optText = (poll.poll_options && poll.poll_options[idx]) || ("option " + idx);
-    what.textContent = ' voted "' + optText + '"';
-    const when = document.createElement("span");
-    when.style.marginLeft = "auto";
-    when.textContent = relTime(v.timestamp);
-    row.appendChild(voter);
-    row.appendChild(what);
-    row.appendChild(when);
+    row.className = "poll-result-row";
+    const num = document.createElement("span");
+    num.className = "opt-num";
+    num.textContent = c.idx + ".";
+    const txt = document.createElement("span");
+    txt.className = "opt-text";
+    txt.textContent = c.text;
+    const pct = total > 0 ? Math.round((c.count / total) * 100) : 0;
+    const tally = document.createElement("span");
+    tally.className = "opt-tally";
+    tally.textContent = c.count + (total > 0 ? " · " + pct + "%" : "");
+    row.appendChild(num);
+    row.appendChild(txt);
+    row.appendChild(tally);
     list.appendChild(row);
   });
-  summary.appendChild(list);
-  return summary;
+  return list;
 }
 
 function renderMessageCard(m, allMsgs) {
@@ -1639,18 +1622,10 @@ function renderMessageCard(m, allMsgs) {
 
   const right = document.createElement("span");
   right.className = "right";
-  if (m.tx_hash) {
-    const link = document.createElement("a");
-    link.href = "#tx-" + m.tx_hash;
-    link.title = formatTs(m.timestamp);
-    link.textContent = relTime(m.timestamp);
-    right.appendChild(link);
-  } else {
-    const ts = document.createElement("span");
-    ts.title = formatTs(m.timestamp);
-    ts.textContent = relTime(m.timestamp);
-    right.appendChild(ts);
-  }
+  const ts = document.createElement("span");
+  ts.title = formatTs(m.timestamp);
+  ts.textContent = relTime(m.timestamp);
+  right.appendChild(ts);
   meta.appendChild(right);
   card.appendChild(meta);
 
@@ -1701,18 +1676,11 @@ function renderMessageCard(m, allMsgs) {
     card.appendChild(text);
   }
 
-  // ------ poll options (clickable to vote)
+  // ------ poll body: clickable options when the user can vote, vote
+  // tally otherwise.  Once the user has voted (or when the poll is
+  // theirs, or read-only) we collapse the buttons into a results view
+  // so the post stops looking like a call-to-action.
   if (m.kind === "poll" && Array.isArray(m.poll_options)) {
-    const list = document.createElement("div");
-    list.className = "poll-options-list";
-    // Three reasons option buttons may be disabled:
-    //   1. read-only mode (no wallet loaded)
-    //   2. poll is yours (chain rejects self-vote on own poll)
-    //   3. you've already voted on this poll (chain rejects duplicate)
-    //      Detected by scanning the visible feed for a kind=vote tx
-    //      from YOU pointing at this poll, OR by the local "just-voted"
-    //      set (survives the optimistic refresh before the vote tx
-    //      lands in the next feed pull).
     const readonly = !YOU || YOU.mode === "read-only";
     const ownPoll = YOU && YOU.entity_id && m.entity_id === YOU.entity_id;
     let alreadyVoted = false;
@@ -1735,32 +1703,27 @@ function renderMessageCard(m, allMsgs) {
         );
       }
     }
-    m.poll_options.forEach((opt, idx) => {
-      const btn = document.createElement("button");
-      btn.className = "poll-opt";
-      const num = document.createElement("span");
-      num.className = "opt-num";
-      num.textContent = idx + ".";
-      const txt = document.createElement("span");
-      txt.className = "opt-text";
-      txt.textContent = opt;
-      btn.appendChild(num);
-      btn.appendChild(txt);
-      if (readonly) {
-        btn.disabled = true;
-        btn.title = "Read-only mode -- load a wallet to vote";
-      } else if (ownPoll) {
-        btn.disabled = true;
-        btn.title = "Cannot vote on your own poll";
-      } else if (alreadyVoted) {
-        btn.disabled = true;
-        btn.title = "You've already voted on this poll (votes are FINAL)";
-      } else {
+    if (readonly || ownPoll || alreadyVoted) {
+      card.appendChild(renderPollResults(m, allMsgs));
+    } else {
+      const list = document.createElement("div");
+      list.className = "poll-options-list";
+      m.poll_options.forEach((opt, idx) => {
+        const btn = document.createElement("button");
+        btn.className = "poll-opt";
+        const num = document.createElement("span");
+        num.className = "opt-num";
+        num.textContent = idx + ".";
+        const txt = document.createElement("span");
+        txt.className = "opt-text";
+        txt.textContent = opt;
+        btn.appendChild(num);
+        btn.appendChild(txt);
         btn.addEventListener("click", () => votePoll(m.tx_hash, idx, opt));
-      }
-      list.appendChild(btn);
-    });
-    card.appendChild(list);
+        list.appendChild(btn);
+      });
+      card.appendChild(list);
+    }
   }
 
   // ------ community tag (clickable -> filter feed)
@@ -1780,39 +1743,57 @@ function renderMessageCard(m, allMsgs) {
     card.appendChild(wrap);
   }
 
-  // ------ actions row (reply / vote / counts)
+  // ------ actions row (vote / reply / permalink)
   if (m.tx_hash) {
     const actions = document.createElement("div");
     actions.className = "actions";
 
-    // React counts (always visible if any).
-    if ((m.ups || 0) > 0 || (m.downs || 0) > 0) {
+    const signedIn = YOU && YOU.mode !== "read-only";
+    const isOwn = signedIn && m.entity_id === YOU.entity_id;
+    const ups = m.ups || 0;
+    const downs = m.downs || 0;
+
+    // Vote arrows: a single combined element that shows the live count
+    // AND acts as the action button.  No more separate "counts vs.
+    // buttons" rows -- those duplicated the arrows.  Read-only viewers
+    // see the same arrows as static (non-button) text.
+    if (signedIn) {
+      const upBtn = document.createElement("button");
+      upBtn.className = "ghost";
+      upBtn.textContent = "▲" + (ups > 0 ? " " + ups : "");
+      upBtn.title = isOwn ? "Cannot react to your own message" : "Upvote";
+      if (isOwn) upBtn.disabled = true;
+      else upBtn.addEventListener("click", () => react(m.tx_hash, 1));
+      const downBtn = document.createElement("button");
+      downBtn.className = "ghost";
+      downBtn.textContent = "▼" + (downs > 0 ? " " + downs : "");
+      downBtn.title = isOwn ? "Cannot react to your own message" : "Downvote";
+      if (isOwn) downBtn.disabled = true;
+      else downBtn.addEventListener("click", () => react(m.tx_hash, 2));
+      actions.appendChild(upBtn);
+      actions.appendChild(downBtn);
+    } else if (ups + downs > 0) {
       const counts = document.createElement("span");
       counts.className = "react-counts";
-      const upS = document.createElement("span");
-      upS.className = "up";
-      upS.textContent = "▲ " + (m.ups || 0);
-      const downS = document.createElement("span");
-      downS.className = "down";
-      downS.textContent = " · ▼ " + (m.downs || 0);
-      counts.appendChild(upS);
-      counts.appendChild(downS);
-      if (m.up_pct != null) {
-        const pct = document.createElement("span");
-        pct.textContent = " · " + Math.round(m.up_pct * 100) + "%";
-        counts.appendChild(pct);
-      }
+      counts.textContent = "▲ " + ups + "  ▼ " + downs;
       actions.appendChild(counts);
     }
+    // %-up indicator (only when both sides have at least one vote, and
+    // the API populated up_pct).  ``up_pct`` is already a percentage
+    // value (0..100) -- not a fraction -- so don't multiply by 100.
+    if (m.up_pct != null && ups + downs > 0) {
+      const pct = document.createElement("span");
+      pct.className = "react-counts";
+      pct.textContent = Math.round(m.up_pct) + "%";
+      actions.appendChild(pct);
+    }
 
-    // Wallet-mode action buttons.  In read-only mode hide them all.
-    if (YOU && YOU.mode !== "read-only") {
-      // No self-react: chain blocks reactions on your own message.
-      const isOwn = m.entity_id === YOU.entity_id;
+    let replyForm = null;
+    if (signedIn) {
       const replyBtn = document.createElement("button");
       replyBtn.className = "ghost";
       replyBtn.textContent = "↳ reply";
-      const replyForm = makeInlineReply(m.tx_hash);
+      replyForm = makeInlineReply(m.tx_hash);
       replyBtn.addEventListener("click", () => {
         replyForm.classList.toggle("open");
         if (replyForm.classList.contains("open")) {
@@ -1820,41 +1801,27 @@ function renderMessageCard(m, allMsgs) {
         }
       });
       actions.appendChild(replyBtn);
-      if (!isOwn) {
-        const up = document.createElement("button");
-        up.className = "ghost";
-        up.textContent = "▲";
-        up.title = "Upvote";
-        up.addEventListener("click", () => react(m.tx_hash, 1));
-        const down = document.createElement("button");
-        down.className = "ghost";
-        down.textContent = "▼";
-        down.title = "Downvote";
-        down.addEventListener("click", () => react(m.tx_hash, 2));
-        actions.appendChild(up);
-        actions.appendChild(down);
-      }
-      const tip = document.createElement("button");
-      tip.className = "ghost";
-      tip.textContent = "💸 tip";
-      tip.title = "Send tokens to this entity";
-      tip.addEventListener("click", () => prefillTip(m.entity_id));
-      if (!isOwn) actions.appendChild(tip);
-
-      const copy = document.createElement("button");
-      copy.className = "ghost";
-      copy.textContent = "🔗";
-      copy.title = "Copy permalink";
-      copy.addEventListener("click", () => {
-        const url = window.location.origin + "/#tx-" + m.tx_hash;
-        copyToClipboard(url);
-      });
-      actions.appendChild(copy);
-      card.appendChild(actions);
-      card.appendChild(replyForm);
-    } else if (actions.children.length > 0) {
-      card.appendChild(actions);
     }
+
+    // Spacer pushes the permalink to the right.  Tipping is no longer
+    // exposed inline -- the user can still send tokens via the
+    // entity profile modal (click the entity hash, then "Send tokens").
+    const spacer = document.createElement("span");
+    spacer.className = "grow";
+    actions.appendChild(spacer);
+
+    const permalink = document.createElement("button");
+    permalink.className = "ghost permalink-btn";
+    permalink.textContent = "permalink";
+    permalink.title = "Copy permalink to clipboard";
+    permalink.addEventListener("click", () => {
+      const url = window.location.origin + "/#tx-" + m.tx_hash;
+      copyToClipboard(url);
+    });
+    actions.appendChild(permalink);
+
+    card.appendChild(actions);
+    if (replyForm) card.appendChild(replyForm);
   }
   return card;
 }
@@ -1902,8 +1869,11 @@ function makeInlineReply(tx_hash) {
         const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
         if (r.status === 200 && r.data && r.data.result &&
             utf8Bytes(ta.value) === bytes) {
-          meta.textContent = bytes + " bytes  ·  ~" +
-            r.data.result.fee_estimate + " token fee";
+          const result = r.data.result;
+          const fee = result.recommended_fee || result.fee_estimate;
+          if (fee != null) {
+            meta.textContent = bytes + " bytes  ·  ~" + fee + " token fee";
+          }
         }
       } catch (_) {}
     } else if (bytes === 0) {
