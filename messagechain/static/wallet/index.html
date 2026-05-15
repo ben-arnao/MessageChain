@@ -119,6 +119,10 @@
     color: var(--muted);
     white-space: nowrap;
   }
+  /* Empty pills (e.g. stake when zero, sigs before /wallet/me lands)
+     hide entirely instead of rendering an empty padded oval in the
+     header. */
+  .pill:empty { display: none; }
   .pill.ok { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
   .pill.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
   .pill.error { color: var(--error); border-color: var(--error); background: var(--error-bg); }
@@ -1064,7 +1068,51 @@ function updateTxHistoryStatus(tx_hash, status) {
 }
 function getMyTxHistory() {
   if (!YOU || !YOU.entity_id) return [];
-  return _lsGet(TX_HISTORY_KEY, []).filter(e => e.entity_id === YOU.entity_id);
+  // Local cache (carries fee data the chain doesn't echo back per-tx).
+  const local = _lsGet(TX_HISTORY_KEY, []).filter(e => e.entity_id === YOU.entity_id);
+  const byHash = new Map(local.map(e => [e.tx_hash, e]));
+  // Augment with anything in the current feed window that's by us.
+  // Covers txs fired before this code shipped + txs from another
+  // device / session.  Confirmed-on-chain by definition (the feed
+  // only surfaces included txs).  fee=null since the API doesn't
+  // return per-message fee.
+  (CURRENT_MESSAGES || []).forEach(m => {
+    if (!m.tx_hash || m.entity_id !== YOU.entity_id) return;
+    if (byHash.has(m.tx_hash)) {
+      // Local entry wins (has the fee) but flip status to confirmed
+      // since the feed proves it landed.
+      const row = byHash.get(m.tx_hash);
+      if (row.status !== "confirmed") row.status = "confirmed";
+      return;
+    }
+    let kind = m.kind || "message";
+    let label = "";
+    if (m.kind === "vote" && m.vote_target) {
+      kind = "vote";
+      label = "vote on " + shortHex(m.vote_target.poll_txid, 10, 6);
+    } else if (m.kind === "poll") {
+      kind = "poll";
+      label = "poll: " + (m.message || "").slice(0, 50);
+    } else if (m.prev) {
+      kind = "message";
+      label = "reply: " + (m.message || "").slice(0, 50);
+    } else {
+      kind = "message";
+      label = (m.message || "").slice(0, 60);
+    }
+    byHash.set(m.tx_hash, {
+      tx_hash: m.tx_hash,
+      kind: kind,
+      fee: null,
+      label: label,
+      entity_id: YOU.entity_id,
+      submitted_at: m.timestamp || 0,
+      status: "confirmed",
+    });
+  });
+  const combined = Array.from(byHash.values());
+  combined.sort((a, b) => (b.submitted_at || 0) - (a.submitted_at || 0));
+  return combined;
 }
 
 function getMyReaction(tx_hash) {
@@ -1709,6 +1757,9 @@ async function refreshFeed() {
     LAST_TOP_HASH = allMsgs.length ? allMsgs[0].tx_hash : null;
     // Flip any pending tx_hashes the feed surfaced over to "confirmed".
     reconcilePendingFromFeed(allMsgs);
+    // Refresh Activity if visible -- feed-derived rows depend on
+    // CURRENT_MESSAGES, so a fresh feed means a fresh history slice.
+    renderActivityIfVisible();
 
     // Populate the community dropdown with whatever communities are
     // actually present in the visible window.  Idempotent -- skips
