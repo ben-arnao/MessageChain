@@ -1297,17 +1297,18 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             'id="composer-text"',
             'id="tab-feed"',
             'id="tab-wallet"',
-            'id="tab-governance"',
             'id="tab-identity"',
-            'id="tab-node"',
+            'id="tab-activity"',
+            # Iter 7h: stake/unstake forms, governance tab, and node
+            # tab were removed from the user-facing wallet UI -- those
+            # are operator concerns driven from the CLI.  /wallet/stake,
+            # /wallet/unstake, /wallet/propose, /wallet/vote-proposal,
+            # and /v1/info still exist on the server for CLI use, but
+            # are no longer wired into the SPA so we don't gate the
+            # landing page on their presence.
             "/wallet/send",
             "/wallet/transfer",
-            "/wallet/stake",
-            "/wallet/unstake",
             "/wallet/react",
-            "/wallet/propose",
-            "/wallet/vote-proposal",
-            "/v1/info",
             "/v1/latest",
             "/v1/entity",
             # Iteration 2 affordances.  Each is the entry point for a
@@ -1322,13 +1323,10 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             "poll_options",
             # Iteration 3 affordances.
             'id="filter-chip"',
-            'id="proposals-list"',
             'id="xfer-to-status"',
-            "/v1/proposals",
             "confirmAction",
             "setCommunityFilter",
             "classifyRecipient",
-            "renderProposal",
             # Iteration 6 affordances.
             'id="feed-time"',
             'id="feed-sort"',

@@ -384,37 +384,6 @@
     margin-bottom: 0.6rem;
   }
   .rep-badge .score { font-weight: 600; font-size: 1.1rem; }
-  .proposal {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 0.7rem 0.9rem;
-    margin-bottom: 0.6rem;
-    background: var(--bg);
-  }
-  .proposal.voted { opacity: 0.7; }
-  .proposal-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 0.6rem;
-    flex-wrap: wrap;
-  }
-  .proposal-title { font-weight: 500; }
-  .proposal-meta { color: var(--muted); font-size: 0.8rem; }
-  .proposal-bar {
-    height: 6px;
-    background: var(--border);
-    border-radius: 999px;
-    overflow: hidden;
-    margin: 0.5rem 0;
-    display: flex;
-  }
-  .proposal-bar .yes { background: var(--accent); height: 100%; }
-  .proposal-bar .no { background: var(--error); height: 100%; }
-  .proposal-counts { color: var(--muted); font-size: 0.8rem; display: flex; gap: 1rem; flex-wrap: wrap; }
-  .proposal-counts .yes { color: var(--accent); }
-  .proposal-counts .no { color: var(--error); }
-  .proposal-actions { display: flex; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap; }
   .msg .poll-options-list {
     display: flex;
     flex-direction: column;
@@ -585,6 +554,11 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.85rem;
   }
+  .activity-row .label .tx-link.synth {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 0.85rem;
+  }
   .activity-row .fee { color: var(--muted); font-size: 0.85rem; }
   .activity-row .status {
     font-size: 0.78rem;
@@ -663,9 +637,7 @@
     <span id="you-id" class="you-id" title="Click to copy your address"></span>
     <span class="grow"></span>
     <span id="you-balance" class="pill" title="your token balance on chain"></span>
-    <span id="you-stake" class="pill" title="your staked tokens"></span>
     <span id="you-sigs" class="pill" title="WOTS+ one-time signatures left on your current key tree (rotate-key to refresh)"></span>
-    <span id="you-chain" class="pill" title="current chain height (read from your local validator's RPC)"></span>
     <button id="auth-create" style="display:none;" title="Generate a fresh demo wallet (public deployments only)">Create account</button>
     <button id="auth-signin" style="display:none;" class="primary">Sign in</button>
     <button id="auth-signout" style="display:none;">Sign out</button>
@@ -674,9 +646,7 @@
     <button data-tab="feed" class="active">Feed</button>
     <button data-tab="wallet">Wallet</button>
     <button data-tab="activity">Activity</button>
-    <button data-tab="governance">Governance</button>
     <button data-tab="identity">Identity</button>
-    <button data-tab="node">Node</button>
   </nav>
 </header>
 
@@ -746,7 +716,7 @@
   <div class="readonly-notice">
     <strong>Read-only mode.</strong>  Restart with
     <code>messagechain --keyfile &lt;path&gt; ui</code> to enable
-    sending tokens, staking, or any other write actions.
+    sending tokens.
   </div>
 
   <div class="panel">
@@ -774,31 +744,6 @@
       <button id="xfer-submit" class="primary">Send transfer</button>
     </div>
   </div>
-
-  <div class="panel write-only">
-    <h2>Stake / unstake</h2>
-    <div class="form-grid">
-      <div class="row-2col">
-        <label>Stake amount<input id="stake-amount" type="number" min="1"></label>
-        <label>Fee <span class="hint">(blank = live auto-fee)</span>
-          <input id="stake-fee" type="number" min="1" placeholder="auto">
-        </label>
-      </div>
-      <button id="stake-submit">Stake</button>
-      <div class="row-2col">
-        <label>Unstake amount<input id="unstake-amount" type="number" min="1"></label>
-        <label>Fee <span class="hint">(blank = live auto-fee)</span>
-          <input id="unstake-fee" type="number" min="1" placeholder="auto">
-        </label>
-      </div>
-      <button id="unstake-submit">Unstake (hot key)</button>
-      <span class="hint">
-        Cold-authority unstake (post-SetAuthorityKey) belongs in the
-        CLI with <code>--cold-keyfile</code>.  The wallet UI does not
-        load cold keys.
-      </span>
-    </div>
-  </div>
 </section>
 
 <!-- ========================================================= Activity -->
@@ -810,48 +755,6 @@
   <div class="panel">
     <h2>All transactions</h2>
     <div id="activity-history" class="hint">No transactions yet.</div>
-  </div>
-</section>
-
-<!-- ======================================================= Governance -->
-<section class="tab-panel" id="tab-governance">
-  <div class="readonly-notice">
-    <strong>Read-only mode.</strong>  Open proposals are visible but
-    you can't vote or open new ones until the wallet is loaded with
-    <code>messagechain --keyfile &lt;path&gt; ui</code>.
-  </div>
-
-  <div class="panel">
-    <h2>Open proposals</h2>
-    <div id="proposals-list" class="hint">loading…</div>
-  </div>
-
-  <div class="panel write-only">
-    <h2>New proposal</h2>
-    <div class="form-grid">
-      <label>Title<input id="prop-title" type="text"></label>
-      <label>Description<textarea id="prop-desc"></textarea></label>
-      <label>Reference hash <span class="hint">(optional, hex)</span>
-        <input id="prop-ref" type="text" placeholder="">
-      </label>
-      <label>Fee <span class="hint">(blank = chain's height-aware floor)</span>
-        <input id="prop-fee" type="number">
-      </label>
-      <button id="prop-submit" class="primary">Open proposal</button>
-    </div>
-  </div>
-
-  <div class="panel write-only">
-    <h2>Vote on a proposal</h2>
-    <div class="form-grid">
-      <label>Proposal ID (64 hex chars)
-        <input id="vote-pid" type="text">
-      </label>
-      <div class="row">
-        <button id="vote-yes" class="primary">Vote YES</button>
-        <button id="vote-no">Vote NO</button>
-      </div>
-    </div>
   </div>
 </section>
 
@@ -882,14 +785,6 @@
       (would block the HTTP request past every reasonable browser
       timeout).
     </p>
-  </div>
-</section>
-
-<!-- ============================================================== Node -->
-<section class="tab-panel" id="tab-node">
-  <div class="panel">
-    <h2>Chain</h2>
-    <div id="node-info" class="hint">loading…</div>
   </div>
 </section>
 
@@ -1382,9 +1277,7 @@ function switchTab(name) {
     }
   }
   if (name === "wallet") refreshWallet();
-  if (name === "node") refreshNode();
   if (name === "identity") refreshIdentity();
-  if (name === "governance") refreshProposals();
   if (name === "activity") {
     renderActivity();
     pollPendingTxStatuses();
@@ -1404,10 +1297,10 @@ async function refreshMe() {
     }
     const m = r.data;
     YOU = m;
-    // Drive a body-level class so write-only forms (transfer, stake,
-    // unstake, governance) hide via CSS.  Without this, every write
-    // panel stays visible in read-only mode and clicking the submit
-    // buttons returns 503 -- "buttons that don't do what they say".
+    // Drive a body-level class so write-only forms (transfer) hide via
+    // CSS in read-only mode.  Without this, every write panel stays
+    // visible and clicking the submit buttons returns 503 -- "buttons
+    // that don't do what they say".
     document.body.classList.toggle("readonly", m.mode === "read-only");
     updateAuthButtons(m);
     if (m.mode === "read-only") {
@@ -1417,7 +1310,6 @@ async function refreshMe() {
       $("you-id").onclick = null;
       $("you-id").oncontextmenu = null;
       $("you-balance").textContent = "";
-      $("you-stake").textContent = "";
       $("you-sigs").textContent = "";
       $("composer").style.display = "none";
     } else {
@@ -1432,7 +1324,6 @@ async function refreshMe() {
         copyToClipboard(m.address || m.entity_id);
       };
       if (m.balance != null) $("you-balance").textContent = m.balance + " bal";
-      if (m.stake != null && m.stake > 0) $("you-stake").textContent = m.stake + " stake";
       if (m.sigs_remaining != null) {
         const s = $("you-sigs");
         s.textContent = m.sigs_remaining + " sigs";
@@ -1448,25 +1339,19 @@ async function refreshMe() {
 }
 
 async function refreshChainStatus() {
+  // Side-effects only: probes /v1/info so the WALLET_MODE +
+  // CREATE_ACCOUNT_ENABLED globals stay current.  The chain-height
+  // pill is no longer surfaced in the user-facing header -- low-level
+  // network state belongs to the CLI / operator tooling.
   try {
     const r = await api("/v1/info");
-    const c = $("you-chain");
-    if (r.status !== 200) {
-      c.textContent = "chain offline";
-      c.className = "pill error";
-      return null;
-    }
-    c.textContent = "h=" + r.data.height;
-    c.className = "pill ok";
-    // Mode hint -- drives sign-in modal warnings + button visibility.
+    if (r.status !== 200) return null;
     if (r.data.wallet_mode === "public" || r.data.wallet_mode === "local") {
       WALLET_MODE = r.data.wallet_mode;
     }
     CREATE_ACCOUNT_ENABLED = !!r.data.create_account_enabled;
     return r.data;
   } catch (_) {
-    $("you-chain").textContent = "chain offline";
-    $("you-chain").className = "pill error";
     return null;
   }
 }
@@ -3323,276 +3208,12 @@ $("xfer-submit").addEventListener("click", async () => {
   }
 });
 
-$("stake-submit").addEventListener("click", async () => {
-  const amount = parseInt($("stake-amount").value);
-  const feeStr = $("stake-fee").value.trim();
-  if (!amount) { toast("Amount required", "err"); return; }
-  // Audit r58 #2: blank fee -> live auto-fee for "stake" kind.
-  const fee = feeStr ? parseInt(feeStr) : await liveFee("stake");
-  if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
-  const pendingId = optimisticPending("stake", "+" + amount + " stake");
-  const installPk = firstSpendPubkey();
-  toast("Sending stake…", "ok");
-  const body = { amount: amount, fee: fee };
-  if (installPk) body.include_pubkey = true;
-  const r = await apiPost("/wallet/stake", body);
-  if (r.status === 200) {
-    if (installPk) markPubkeyInstalled();
-    finalizePending(pendingId, r.data.result.tx_hash, fee);
-    toast("Sent ✓ stake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-    $("stake-amount").value = "";
-    refreshWallet();
-  } else {
-    dropPending(pendingId);
-    toast("Stake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
-  }
-});
-
-$("unstake-submit").addEventListener("click", async () => {
-  const amount = parseInt($("unstake-amount").value);
-  const feeStr = $("unstake-fee").value.trim();
-  if (!amount) { toast("Amount required", "err"); return; }
-  // Audit r58 #2: blank fee -> live auto-fee for "unstake" kind.
-  const fee = feeStr ? parseInt(feeStr) : await liveFee("unstake");
-  if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
-  // Unstaking requires already-staked tokens, which requires an
-  // already-registered pubkey -- so no first-spend wiring needed.
-  const pendingId = optimisticPending("unstake", "-" + amount + " stake");
-  toast("Sending unstake…", "ok");
-  const r = await apiPost("/wallet/unstake", { amount: amount, fee: fee });
-  if (r.status === 200) {
-    finalizePending(pendingId, r.data.result.tx_hash, fee);
-    toast("Sent ✓ unstake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-    $("unstake-amount").value = "";
-    refreshWallet();
-  } else {
-    dropPending(pendingId);
-    toast("Unstake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
-  }
-});
-
-// ========================================================== Governance tab
-$("prop-submit").addEventListener("click", async () => {
-  const title = $("prop-title").value.trim();
-  const desc = $("prop-desc").value.trim();
-  const ref = $("prop-ref").value.trim();
-  const feeStr = $("prop-fee").value.trim();
-  if (!title) { toast("Title required", "err"); return; }
-  const body = { title: title, description: desc };
-  if (ref) body.reference_hash = ref;
-  // Audit r58 #2: explicit fee preferred; blank -> live per-kind quote
-  // including title+description payload-byte surcharge (Tier 19 propose
-  // floor) AND live base_fee.
-  if (feeStr) {
-    body.fee = parseInt(feeStr);
-  } else {
-    const pb = utf8Bytes(title) + utf8Bytes(desc);
-    body.fee = await liveFee("propose", { payload_bytes: pb });
-  }
-  // Proposal txs don't carry a sender_pubkey field, so a fresh wallet
-  // must register itself via a message/transfer/stake first.
-  if (!requirePubkeyOrToast("opening a proposal")) return;
-  const propLabel = "proposal: " + (title.length > 50 ? title.slice(0, 50) + "…" : title);
-  const pendingId = optimisticPending("propose", propLabel);
-  toast("Opening proposal…", "ok");
-  const r = await apiPost("/wallet/propose", body);
-  if (r.status === 200) {
-    finalizePending(
-      pendingId,
-      r.data.result.tx_hash || r.data.result.proposal_id,
-      body.fee,
-    );
-    toast("Sent ✓ proposal " + shortHex(r.data.result.proposal_id, 8, 6), "ok");
-    $("prop-title").value = "";
-    $("prop-desc").value = "";
-    $("prop-ref").value = "";
-    $("prop-fee").value = "";
-  } else {
-    dropPending(pendingId);
-    toast("Propose failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
-  }
-});
-
-async function castVote(approve, pidOverride) {
-  const pid = (pidOverride || $("vote-pid").value).trim();
-  if (pid.length !== 64) { toast("Proposal id must be 64 hex chars", "err"); return; }
-  // Governance votes don't carry sender_pubkey either.
-  if (!requirePubkeyOrToast("voting on a proposal")) return;
-  const voteLabel = (approve ? "YES" : "NO") + " on " + shortHex(pid, 10, 6);
-  const pendingId = optimisticPending("vote-proposal", voteLabel);
-  toast("Sending vote…", "ok");
-  const r = await apiPost("/wallet/vote-proposal", {
-    proposal_id: pid, approve: approve,
-  });
-  if (r.status === 200) {
-    const realHash = (r.data.result && (r.data.result.tx_hash || r.data.result.vote_tx_hash)) || pid;
-    const realFee = r.data.result && r.data.result.fee;
-    finalizePending(pendingId, realHash, realFee);
-    toast("Sent ✓ vote " + (approve ? "YES" : "NO") + " on " + shortHex(pid, 8, 6), "ok");
-    // Clear the manual proposal-id form once the vote landed -- a
-    // stale id sitting there after success looks like the action
-    // didn't take.  Refresh the list so the row re-renders with a
-    // "✓ voted" badge and the inline vote buttons hide.
-    if (!pidOverride) $("vote-pid").value = "";
-    refreshProposals();
-  } else {
-    dropPending(pendingId);
-    toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
-  }
-}
-$("vote-yes").addEventListener("click", () => castVote(true));
-$("vote-no").addEventListener("click", () => castVote(false));
-
-// ---- Open proposals list ----
-async function refreshProposals() {
-  const el = $("proposals-list");
-  el.textContent = "loading…";
-  try {
-    const r = await api("/v1/proposals");
-    if (r.status !== 200 || !r.data || !r.data.ok) {
-      el.textContent = (r.data && r.data.error) || "Failed to load proposals.";
-      return;
-    }
-    const rows = (r.data.result && r.data.result.proposals) || [];
-    if (rows.length === 0) {
-      el.textContent = "No proposals on chain yet.";
-      return;
-    }
-    el.innerHTML = "";
-    rows.forEach(p => el.appendChild(renderProposal(p)));
-  } catch (_) {
-    el.textContent = "Validator unreachable.";
-  }
-}
-
-function renderProposal(p) {
-  const card = document.createElement("div");
-  card.className = "proposal" + (p.voted ? " voted" : "");
-
-  const head = document.createElement("div");
-  head.className = "proposal-head";
-  const title = document.createElement("div");
-  title.className = "proposal-title";
-  title.textContent = p.title || "(untitled)";
-  head.appendChild(title);
-
-  const right = document.createElement("div");
-  right.className = "proposal-meta";
-  const status = (p.status || "").toLowerCase();
-  const statusPill = document.createElement("span");
-  statusPill.className = "pill " + (status === "open" ? "ok"
-    : status === "passed" ? "ok"
-    : status === "rejected" ? "error"
-    : "");
-  statusPill.textContent = p.status;
-  right.appendChild(statusPill);
-  if (p.voted) {
-    const voted = document.createElement("span");
-    voted.className = "pill ok";
-    voted.style.marginLeft = "0.4rem";
-    voted.textContent = "✓ voted";
-    right.appendChild(voted);
-  }
-  head.appendChild(right);
-  card.appendChild(head);
-
-  const meta = document.createElement("div");
-  meta.className = "proposal-meta";
-  meta.textContent =
-    "id " + shortHex(p.proposal_id, 10, 6) +
-    "  ·  block " + p.created_at_block +
-    "  ·  " + (p.blocks_remaining > 0
-      ? p.blocks_remaining + " blocks remaining"
-      : "voting closed");
-  card.appendChild(meta);
-
-  // Tally bar -- yes vs no.  Width is share of CAST weight (excludes
-  // silent electorate so a 0/0 proposal shows an empty bar).
-  const yes = p.yes_weight || 0;
-  const no = p.no_weight || 0;
-  const cast = yes + no;
-  const yesPct = cast > 0 ? Math.round((yes / cast) * 100) : 0;
-  const noPct = cast > 0 ? 100 - yesPct : 0;
-  const bar = document.createElement("div");
-  bar.className = "proposal-bar";
-  if (cast > 0) {
-    const yesBar = document.createElement("div");
-    yesBar.className = "yes";
-    yesBar.style.width = yesPct + "%";
-    const noBar = document.createElement("div");
-    noBar.className = "no";
-    noBar.style.width = noPct + "%";
-    bar.appendChild(yesBar);
-    bar.appendChild(noBar);
-  }
-  card.appendChild(bar);
-
-  const counts = document.createElement("div");
-  counts.className = "proposal-counts";
-  const yesS = document.createElement("span");
-  yesS.className = "yes";
-  yesS.textContent = "▲ YES " + yes + (cast > 0 ? " (" + yesPct + "%)" : "");
-  const noS = document.createElement("span");
-  noS.className = "no";
-  noS.textContent = "▼ NO " + no + (cast > 0 ? " (" + noPct + "%)" : "");
-  const ct = document.createElement("span");
-  ct.textContent = (p.vote_count || 0) + " voters  ·  " +
-    (p.total_eligible || 0) + " eligible weight";
-  counts.appendChild(yesS);
-  counts.appendChild(noS);
-  counts.appendChild(ct);
-  card.appendChild(counts);
-
-  // Inline vote buttons.  Hidden for read-only mode, voting-closed
-  // status, and proposals the loaded entity has already voted on.
-  if (YOU && YOU.mode !== "read-only" && status === "open" && !p.voted) {
-    const actions = document.createElement("div");
-    actions.className = "proposal-actions";
-    const yBtn = document.createElement("button");
-    yBtn.className = "primary";
-    yBtn.textContent = "Vote YES";
-    yBtn.addEventListener("click", async () => {
-      const ok = await confirmAction({
-        title: "Confirm YES vote",
-        body: 'Vote YES on:\n\n"' + (p.title || "(untitled)") +
-          '"\n\nVotes are FINAL on chain.',
-        okLabel: "Vote YES",
-        okClass: "primary",
-      });
-      if (ok) castVote(true, p.proposal_id);
-    });
-    const nBtn = document.createElement("button");
-    nBtn.textContent = "Vote NO";
-    nBtn.addEventListener("click", async () => {
-      const ok = await confirmAction({
-        title: "Confirm NO vote",
-        body: 'Vote NO on:\n\n"' + (p.title || "(untitled)") +
-          '"\n\nVotes are FINAL on chain.',
-        okLabel: "Vote NO",
-      });
-      if (ok) castVote(false, p.proposal_id);
-    });
-    const idBtn = document.createElement("button");
-    idBtn.className = "ghost";
-    idBtn.textContent = "Copy id";
-    idBtn.addEventListener("click", () => copyToClipboard(p.proposal_id));
-    actions.appendChild(yBtn);
-    actions.appendChild(nBtn);
-    actions.appendChild(idBtn);
-    card.appendChild(actions);
-  } else {
-    // Even when no vote actions, expose copy-id for power users.
-    const actions = document.createElement("div");
-    actions.className = "proposal-actions";
-    const idBtn = document.createElement("button");
-    idBtn.className = "ghost";
-    idBtn.textContent = "Copy id";
-    idBtn.addEventListener("click", () => copyToClipboard(p.proposal_id));
-    actions.appendChild(idBtn);
-    card.appendChild(actions);
-  }
-  return card;
-}
+// Stake / unstake forms, the governance tab (propose / vote-on-
+// proposal), and the Node tab were removed from the wallet UI -- those
+// are operator concerns and belong to the CLI.  The /wallet/stake,
+// /wallet/unstake, /wallet/propose, /wallet/vote-proposal, and /v1/info
+// + /v1/proposals HTTP routes still exist on the server side for the
+// CLI to drive.
 
 // ============================================================ Identity tab
 async function refreshIdentity() {
@@ -3622,38 +3243,6 @@ async function refreshIdentity() {
     me.pubkey_registered ? "yes" : "no — first outgoing tx will install it"));
   el.appendChild(row("WOTS+ leaves left",
     (me.sigs_remaining ?? "?") + (me.sigs_remaining < 100 ? "  ⚠ rotate soon" : "")));
-}
-
-// ================================================================= Node tab
-async function refreshNode() {
-  const r = await api("/v1/info");
-  const el = $("node-info");
-  if (r.status !== 200 || !r.data) {
-    el.textContent = "Validator unreachable.";
-    return;
-  }
-  const i = r.data;
-  function row(k, v, copy) {
-    const r = document.createElement("div");
-    r.className = "field-row";
-    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
-    const vv = document.createElement("div"); vv.className = "v"; vv.textContent = v;
-    if (copy) {
-      vv.classList.add("copyable");
-      vv.title = "click to copy";
-      vv.addEventListener("click", () => copyToClipboard(copy));
-    }
-    r.appendChild(kk); r.appendChild(vv);
-    return r;
-  }
-  el.innerHTML = "";
-  el.appendChild(row("chain id", i.chain_id || "?"));
-  el.appendChild(row("height", String(i.height ?? "?")));
-  if (i.tip_hash) el.appendChild(row("tip hash", i.tip_hash, i.tip_hash));
-  if (i.state_root) el.appendChild(row("state root", i.state_root, i.state_root));
-  if (i.genesis_hash) el.appendChild(row("genesis", i.genesis_hash, i.genesis_hash));
-  if (i.last_block_timestamp) el.appendChild(row("last block",
-    formatTs(i.last_block_timestamp) + " (" + relTime(i.last_block_timestamp) + ")"));
 }
 
 // =================================================================== boot
@@ -3688,9 +3277,9 @@ async function refreshNode() {
   // refresh / accidental Esc / chain-reject).  Done AFTER the first
   // refresh so the textarea isn't blanked by the meta-line update.
   restoreComposerDraft();
-  // Restore tab from URL hash if present (e.g. #wallet, #governance).
+  // Restore tab from URL hash if present (e.g. #wallet, #identity).
   const hash = window.location.hash;
-  const tabMatch = hash.match(/^#(feed|wallet|activity|governance|identity|node)$/);
+  const tabMatch = hash.match(/^#(feed|wallet|activity|identity)$/);
   if (tabMatch) switchTab(tabMatch[1]);
   setInterval(refreshChainStatus, 8000);
   setInterval(pollNewActivity, 12000);
