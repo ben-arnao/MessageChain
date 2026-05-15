@@ -225,9 +225,16 @@
     color: var(--accent);
     font-weight: 500;
   }
-  .msg .meta .right { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .msg .meta .right { display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; }
   .msg .meta .right a { color: var(--muted); }
   .msg .meta .right a:hover { color: var(--accent); }
+  .msg .meta .meta-sep { color: var(--muted); }
+  .msg .meta .meta-link {
+    color: var(--muted);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .msg .meta .meta-link:hover { color: var(--accent); text-decoration: none; }
   .msg .text {
     margin-top: 0.4rem;
     white-space: pre-wrap;
@@ -248,7 +255,30 @@
   }
   .msg .actions button { padding: 0.2rem 0.55rem; font-size: 0.85rem; }
   .msg .actions .grow { flex-grow: 1; }
-  .msg .actions .permalink-btn { color: var(--muted); font-size: 0.8rem; }
+  /* Highlighted upvote/downvote when the user has already cast that
+     reaction.  Tracked client-side in localStorage (the chain returns
+     aggregate counts only, not per-user state) so the indicator shows
+     instantly without waiting for a feed-poll round trip. */
+  .msg .actions button.voted-up {
+    background: var(--accent-bg);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .msg .actions button.voted-down {
+    background: var(--error-bg);
+    border-color: var(--error);
+    color: var(--error);
+  }
+  .msg .poll-result-row.my-pick {
+    background: var(--accent-bg);
+    border-color: var(--accent);
+  }
+  .msg .poll-result-row.my-pick .opt-text { color: var(--accent); font-weight: 500; }
+  .msg .poll-options-list .poll-opt.my-pick {
+    background: var(--accent-bg);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
   .msg .react-counts { color: var(--muted); font-size: 0.8rem; margin-right: 0.3rem; }
   .msg .react-counts .up { color: var(--accent); }
   .msg .react-counts .down { color: var(--error); }
@@ -528,6 +558,63 @@
     .you-row .pill { font-size: 0.72rem; padding: 0.1rem 0.45rem; }
   }
 
+  /* ----- Activity tab (pending + history) ----- */
+  .activity-row {
+    display: grid;
+    grid-template-columns: 6rem 1fr auto auto;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.45rem 0.2rem;
+    border-bottom: 1px dashed var(--border);
+    font-size: 0.9rem;
+  }
+  .activity-row:last-child { border-bottom: none; }
+  .activity-row .kind {
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .activity-row .label { word-break: break-word; }
+  .activity-row .label a {
+    color: var(--accent);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+  }
+  .activity-row .fee { color: var(--muted); font-size: 0.85rem; }
+  .activity-row .status {
+    font-size: 0.78rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .activity-row .status.pending {
+    background: var(--warn-bg);
+    border-color: var(--warn);
+    color: var(--warn);
+  }
+  .activity-row .status.confirmed {
+    background: var(--accent-bg);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .activity-row .status.failed {
+    background: var(--error-bg);
+    border-color: var(--error);
+    color: var(--error);
+  }
+  @media (max-width: 480px) {
+    .activity-row {
+      grid-template-columns: 1fr auto;
+      grid-template-rows: auto auto;
+    }
+    .activity-row .kind { grid-column: 1 / 2; grid-row: 1; }
+    .activity-row .status { grid-column: 2 / 3; grid-row: 1; }
+    .activity-row .label { grid-column: 1 / 3; grid-row: 2; }
+    .activity-row .fee { grid-column: 1 / 3; grid-row: 2; justify-self: end; }
+  }
+
   .hint { color: var(--muted); font-size: 0.85rem; }
   .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
   .copyable {
@@ -582,6 +669,7 @@
   <nav class="tabs">
     <button data-tab="feed" class="active">Feed</button>
     <button data-tab="wallet">Wallet</button>
+    <button data-tab="activity">Activity</button>
     <button data-tab="governance">Governance</button>
     <button data-tab="identity">Identity</button>
     <button data-tab="node">Node</button>
@@ -706,6 +794,18 @@
         load cold keys.
       </span>
     </div>
+  </div>
+</section>
+
+<!-- ========================================================= Activity -->
+<section class="tab-panel" id="tab-activity">
+  <div class="panel">
+    <h2>Pending</h2>
+    <div id="activity-pending" class="hint">No pending transactions.</div>
+  </div>
+  <div class="panel">
+    <h2>All transactions</h2>
+    <div id="activity-history" class="hint">No transactions yet.</div>
   </div>
 </section>
 
@@ -888,6 +988,241 @@ async function copyToClipboard(text) {
 // =========================================================== global "you"
 let YOU = null;  // last /wallet/me response (may be null if unreachable)
 
+// =========================================================== local tx-state caches
+//
+// Three localStorage-backed caches power the Activity tab + the
+// "your choice" highlight on votes and polls:
+//
+//   mc.wallet.tx-history       -- array of every tx the wallet has
+//                                 fired (kind, tx_hash, fee, label,
+//                                 timestamp, status).  Persists across
+//                                 page reloads so a refresh doesn't
+//                                 erase the user's pending list.
+//   mc.wallet.my-reactions     -- tx_hash -> 1 (up) | 2 (down), so the
+//                                 vote arrows can highlight the user's
+//                                 chosen direction instantly (the chain
+//                                 only returns aggregate counts, not
+//                                 per-user state).
+//   mc.wallet.voted-polls      -- existing Set of poll tx_hashes that
+//                                 the user has voted on (used by the
+//                                 already-voted gate in renderMessageCard).
+//   mc.wallet.poll-vote-choices -- poll tx_hash -> option_index, so
+//                                 the chosen option can be highlighted
+//                                 in the poll-results view before the
+//                                 next feed-poll surfaces the vote tx.
+//
+// All three are best-effort caches.  When a vote/react tx is observed
+// in the feed by YOU, that is the authoritative source -- the cache
+// just covers the latency gap between firing and confirmation.
+const TX_HISTORY_KEY = "mc.wallet.tx-history";
+const MY_REACTIONS_KEY = "mc.wallet.my-reactions";
+const POLL_CHOICES_KEY = "mc.wallet.poll-vote-choices";
+const TX_HISTORY_MAX = 500;
+
+function _lsGet(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (_) { return fallback; }
+}
+function _lsSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+}
+
+function pushTxHistory(entry) {
+  // Tx history is scoped to the current wallet's entity_id so signing
+  // out + back in as a different identity doesn't blend two histories.
+  // Read-only viewers never call this.
+  if (!YOU || !YOU.entity_id || !entry || !entry.tx_hash) return;
+  const arr = _lsGet(TX_HISTORY_KEY, []);
+  // Dedup by tx_hash: re-firing the same handler (shouldn't happen,
+  // but be defensive) overwrites instead of duplicating.
+  const idx = arr.findIndex(e => e.tx_hash === entry.tx_hash);
+  const row = {
+    tx_hash: entry.tx_hash,
+    kind: entry.kind || "tx",
+    fee: entry.fee != null ? entry.fee : null,
+    label: entry.label || "",
+    entity_id: YOU.entity_id,
+    submitted_at: Math.floor(Date.now() / 1000),
+    status: entry.status || "pending",
+  };
+  if (idx >= 0) arr[idx] = Object.assign(arr[idx], row);
+  else arr.unshift(row);
+  // Cap so a long-running wallet doesn't push localStorage over its quota.
+  if (arr.length > TX_HISTORY_MAX) arr.length = TX_HISTORY_MAX;
+  _lsSet(TX_HISTORY_KEY, arr);
+  renderActivityIfVisible();
+}
+function updateTxHistoryStatus(tx_hash, status) {
+  const arr = _lsGet(TX_HISTORY_KEY, []);
+  const row = arr.find(e => e.tx_hash === tx_hash);
+  if (!row || row.status === status) return;
+  row.status = status;
+  _lsSet(TX_HISTORY_KEY, arr);
+  renderActivityIfVisible();
+}
+function getMyTxHistory() {
+  if (!YOU || !YOU.entity_id) return [];
+  return _lsGet(TX_HISTORY_KEY, []).filter(e => e.entity_id === YOU.entity_id);
+}
+
+function getMyReaction(tx_hash) {
+  if (!YOU || !YOU.entity_id) return 0;
+  const m = _lsGet(MY_REACTIONS_KEY, {});
+  const bucket = m[YOU.entity_id];
+  return (bucket && bucket[tx_hash]) || 0;
+}
+function setMyReaction(tx_hash, choice) {
+  if (!YOU || !YOU.entity_id) return;
+  const m = _lsGet(MY_REACTIONS_KEY, {});
+  if (!m[YOU.entity_id]) m[YOU.entity_id] = {};
+  m[YOU.entity_id][tx_hash] = choice;
+  _lsSet(MY_REACTIONS_KEY, m);
+}
+
+function getMyPollPick(pollTx, allMsgs) {
+  if (!YOU || !YOU.entity_id) return null;
+  // Chain-derived first: any vote tx by YOU targeting this poll wins.
+  if (Array.isArray(allMsgs)) {
+    for (const x of allMsgs) {
+      if (x.kind === "vote" && x.entity_id === YOU.entity_id &&
+          x.vote_target && x.vote_target.poll_txid === pollTx) {
+        return x.vote_target.option_index;
+      }
+    }
+  }
+  // Fall back to local cache so the highlight appears between firing
+  // the vote tx and the next feed-poll round trip.
+  const m = _lsGet(POLL_CHOICES_KEY, {});
+  const bucket = m[YOU.entity_id];
+  if (bucket && bucket[pollTx] != null) return bucket[pollTx];
+  return null;
+}
+function setMyPollPick(pollTx, idx) {
+  if (!YOU || !YOU.entity_id) return;
+  const m = _lsGet(POLL_CHOICES_KEY, {});
+  if (!m[YOU.entity_id]) m[YOU.entity_id] = {};
+  m[YOU.entity_id][pollTx] = idx;
+  _lsSet(POLL_CHOICES_KEY, m);
+}
+
+const TX_KIND_LABEL = {
+  message: "post",
+  poll: "poll",
+  vote: "poll vote",
+  react: "react",
+  transfer: "transfer",
+  stake: "stake",
+  unstake: "unstake",
+  propose: "proposal",
+  "vote-proposal": "gov vote",
+};
+
+function renderActivityIfVisible() {
+  const tabActive = document.getElementById("tab-activity")
+    && document.getElementById("tab-activity").classList.contains("active");
+  if (tabActive) renderActivity();
+}
+
+function renderActivity() {
+  const pendingEl = $("activity-pending");
+  const histEl = $("activity-history");
+  if (!pendingEl || !histEl) return;
+  const rows = getMyTxHistory();
+  const pending = rows.filter(r => r.status === "pending");
+  const all = rows;
+
+  function buildRow(r) {
+    const row = document.createElement("div");
+    row.className = "activity-row";
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = TX_KIND_LABEL[r.kind] || r.kind;
+    const label = document.createElement("span");
+    label.className = "label";
+    if (r.label) {
+      const text = document.createTextNode(r.label + "  ");
+      label.appendChild(text);
+    }
+    const a = document.createElement("a");
+    a.href = "#tx-" + r.tx_hash;
+    a.textContent = shortHex(r.tx_hash, 10, 6);
+    a.title = r.tx_hash + "\nsubmitted " + formatTs(r.submitted_at);
+    a.addEventListener("click", e => {
+      e.preventDefault();
+      window.location.hash = "tx-" + r.tx_hash;
+      switchTab("feed");
+    });
+    label.appendChild(a);
+    const fee = document.createElement("span");
+    fee.className = "fee";
+    fee.textContent = (r.fee != null) ? (r.fee + " fee") : "";
+    const status = document.createElement("span");
+    status.className = "status " + r.status;
+    status.textContent = r.status;
+    row.appendChild(kind);
+    row.appendChild(label);
+    row.appendChild(fee);
+    row.appendChild(status);
+    return row;
+  }
+
+  pendingEl.innerHTML = "";
+  if (pending.length === 0) {
+    pendingEl.className = "hint";
+    pendingEl.textContent = "No pending transactions.";
+  } else {
+    pendingEl.className = "";
+    pending.forEach(r => pendingEl.appendChild(buildRow(r)));
+  }
+
+  histEl.innerHTML = "";
+  if (all.length === 0) {
+    histEl.className = "hint";
+    histEl.textContent = "No transactions yet.";
+  } else {
+    histEl.className = "";
+    all.forEach(r => histEl.appendChild(buildRow(r)));
+  }
+}
+
+// Poll pending tx_hashes against /v1/tx_status so the status flips
+// from "pending" to "confirmed" without a manual page refresh.  We
+// also reconcile against the feed: any tx_hash the feed surfaces
+// counts as confirmed, even if the tx_status RPC is slow.
+async function pollPendingTxStatuses() {
+  if (!YOU || !YOU.entity_id) return;
+  const pending = getMyTxHistory().filter(r => r.status === "pending");
+  if (pending.length === 0) return;
+  for (const row of pending) {
+    try {
+      const r = await api("/v1/tx_status?tx_hash=" + encodeURIComponent(row.tx_hash));
+      if (r.status === 200 && r.data && r.data.ok) {
+        const result = r.data.result || {};
+        if (result.status === "included") {
+          updateTxHistoryStatus(row.tx_hash, "confirmed");
+        }
+      }
+    } catch (_) { /* network blip -- try again next tick */ }
+  }
+}
+
+// Reconcile pending->confirmed for any tx_hash the feed renders by
+// the current entity.  Cheap (set lookup over visible messages) and
+// covers the common case where the feed surfaces the tx before
+// /v1/tx_status acknowledges it.
+function reconcilePendingFromFeed(messages) {
+  if (!YOU || !YOU.entity_id || !Array.isArray(messages)) return;
+  const pending = getMyTxHistory().filter(r => r.status === "pending");
+  if (pending.length === 0) return;
+  const seen = new Set();
+  messages.forEach(m => { if (m.tx_hash) seen.add(m.tx_hash); });
+  pending.forEach(p => {
+    if (seen.has(p.tx_hash)) updateTxHistoryStatus(p.tx_hash, "confirmed");
+  });
+}
+
 // =========================================================== tab switching
 document.querySelectorAll("nav.tabs button").forEach(btn => {
   btn.addEventListener("click", () => switchTab(btn.dataset.tab));
@@ -909,6 +1244,10 @@ function switchTab(name) {
   if (name === "node") refreshNode();
   if (name === "identity") refreshIdentity();
   if (name === "governance") refreshProposals();
+  if (name === "activity") {
+    renderActivity();
+    pollPendingTxStatuses();
+  }
 }
 
 // =========================================================== "you" header
@@ -1183,8 +1522,14 @@ composerPost.addEventListener("click", async () => {
     }
     const r = await apiPost("/wallet/send", body);
     if (r.status === 200) {
-      toast((isPoll ? "Poll opened ✓ " : "Posted ✓ ") +
+      toast((isPoll ? "Poll opened ✓ " : "Sent ✓ ") +
         shortHex(r.data.result.tx_hash, 8, 6), "ok");
+      pushTxHistory({
+        tx_hash: r.data.result.tx_hash,
+        kind: isPoll ? "poll" : "message",
+        fee: body.fee,
+        label: text.length > 60 ? text.slice(0, 60) + "…" : text,
+      });
       refreshMe();
     } else {
       restoreComposer();
@@ -1362,6 +1707,8 @@ async function refreshFeed() {
     CURRENT_MESSAGES = allMsgs;
     LAST_HEIGHT = r.data.height || LAST_HEIGHT;
     LAST_TOP_HASH = allMsgs.length ? allMsgs[0].tx_hash : null;
+    // Flip any pending tx_hashes the feed surfaced over to "confirmed".
+    reconcilePendingFromFeed(allMsgs);
 
     // Populate the community dropdown with whatever communities are
     // actually present in the visible window.  Idempotent -- skips
@@ -1583,9 +1930,13 @@ function renderPollResults(poll, allMsgs) {
     ).length,
   }));
   const total = counts.reduce((acc, c) => acc + c.count, 0);
+  // Which option did the *current* user pick?  Source-of-truth chain
+  // data (a vote tx by YOU in allMsgs) wins; the localStorage cache
+  // covers the gap between cast-tx and first feed-poll that surfaces it.
+  const myPick = getMyPollPick(poll.tx_hash, allMsgs);
   counts.forEach(c => {
     const row = document.createElement("div");
-    row.className = "poll-result-row";
+    row.className = "poll-result-row" + (c.idx === myPick ? " my-pick" : "");
     const num = document.createElement("span");
     num.className = "opt-num";
     num.textContent = c.idx + ".";
@@ -1595,7 +1946,9 @@ function renderPollResults(poll, allMsgs) {
     const pct = total > 0 ? Math.round((c.count / total) * 100) : 0;
     const tally = document.createElement("span");
     tally.className = "opt-tally";
-    tally.textContent = c.count + (total > 0 ? " · " + pct + "%" : "");
+    let tallyText = c.count + (total > 0 ? " · " + pct + "%" : "");
+    if (c.idx === myPick) tallyText = "✓ " + tallyText;
+    tally.textContent = tallyText;
     row.appendChild(num);
     row.appendChild(txt);
     row.appendChild(tally);
@@ -1609,7 +1962,7 @@ function renderMessageCard(m, allMsgs) {
   card.className = "msg";
   if (m.tx_hash) card.id = "tx-" + m.tx_hash;
 
-  // ------ meta row (entity + permalink + timestamp)
+  // ------ meta row (entity + timestamp · link)
   const meta = document.createElement("div");
   meta.className = "meta";
   const ent = document.createElement("span");
@@ -1626,6 +1979,23 @@ function renderMessageCard(m, allMsgs) {
   ts.title = formatTs(m.timestamp);
   ts.textContent = relTime(m.timestamp);
   right.appendChild(ts);
+  if (m.tx_hash) {
+    const sep = document.createElement("span");
+    sep.className = "meta-sep";
+    sep.textContent = "·";
+    right.appendChild(sep);
+    const linkUrl = window.location.origin + "/#tx-" + m.tx_hash;
+    const link = document.createElement("a");
+    link.className = "meta-link";
+    link.textContent = "link";
+    link.href = linkUrl;
+    link.title = "Copy permalink to clipboard";
+    link.addEventListener("click", e => {
+      e.preventDefault();
+      copyToClipboard(linkUrl);
+    });
+    right.appendChild(link);
+  }
   meta.appendChild(right);
   card.appendChild(meta);
 
@@ -1758,16 +2128,19 @@ function renderMessageCard(m, allMsgs) {
     // buttons" rows -- those duplicated the arrows.  Read-only viewers
     // see the same arrows as static (non-button) text.
     if (signedIn) {
+      const myChoice = getMyReaction(m.tx_hash);
       const upBtn = document.createElement("button");
-      upBtn.className = "ghost";
+      upBtn.className = "ghost" + (myChoice === 1 ? " voted-up" : "");
       upBtn.textContent = "▲" + (ups > 0 ? " " + ups : "");
-      upBtn.title = isOwn ? "Cannot react to your own message" : "Upvote";
+      upBtn.title = isOwn ? "Cannot react to your own message"
+        : (myChoice === 1 ? "You upvoted this" : "Upvote");
       if (isOwn) upBtn.disabled = true;
       else upBtn.addEventListener("click", () => react(m.tx_hash, 1));
       const downBtn = document.createElement("button");
-      downBtn.className = "ghost";
+      downBtn.className = "ghost" + (myChoice === 2 ? " voted-down" : "");
       downBtn.textContent = "▼" + (downs > 0 ? " " + downs : "");
-      downBtn.title = isOwn ? "Cannot react to your own message" : "Downvote";
+      downBtn.title = isOwn ? "Cannot react to your own message"
+        : (myChoice === 2 ? "You downvoted this" : "Downvote");
       if (isOwn) downBtn.disabled = true;
       else downBtn.addEventListener("click", () => react(m.tx_hash, 2));
       actions.appendChild(upBtn);
@@ -1802,23 +2175,6 @@ function renderMessageCard(m, allMsgs) {
       });
       actions.appendChild(replyBtn);
     }
-
-    // Spacer pushes the permalink to the right.  Tipping is no longer
-    // exposed inline -- the user can still send tokens via the
-    // entity profile modal (click the entity hash, then "Send tokens").
-    const spacer = document.createElement("span");
-    spacer.className = "grow";
-    actions.appendChild(spacer);
-
-    const permalink = document.createElement("button");
-    permalink.className = "ghost permalink-btn";
-    permalink.textContent = "permalink";
-    permalink.title = "Copy permalink to clipboard";
-    permalink.addEventListener("click", () => {
-      const url = window.location.origin + "/#tx-" + m.tx_hash;
-      copyToClipboard(url);
-    });
-    actions.appendChild(permalink);
 
     card.appendChild(actions);
     if (replyForm) card.appendChild(replyForm);
@@ -1910,7 +2266,13 @@ function makeInlineReply(tx_hash) {
         message: text, fee: fee, prev: tx_hash,
       });
       if (r.status === 200) {
-        toast("Reply sent ✓", "ok");
+        toast("Sent ✓ " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+        pushTxHistory({
+          tx_hash: r.data.result.tx_hash,
+          kind: "message",
+          fee: fee,
+          label: "reply: " + (text.length > 50 ? text.slice(0, 50) + "…" : text),
+        });
         refreshMe();
       } else {
         // Restore the user's text so they can edit and retry.
@@ -1978,6 +2340,7 @@ async function liveFee(kindOrBytes, opts) {
 }
 
 async function react(targetHex, choice) {
+  toast(choice === 1 ? "Sending upvote…" : "Sending downvote…", "ok");
   const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: targetHex,
@@ -1986,7 +2349,19 @@ async function react(targetHex, choice) {
     fee: fee,
   });
   if (r.status === 200) {
-    toast((choice === 1 ? "Upvoted " : "Downvoted ") + shortHex(targetHex, 8, 6), "ok");
+    // Stash the choice locally so the arrow stays highlighted between
+    // now and the next feed-poll round trip.  Authoritative state will
+    // arrive once the react tx surfaces, but the highlight should feel
+    // instant on click.
+    setMyReaction(targetHex, choice);
+    toast("Sent ✓ " + (choice === 1 ? "upvote" : "downvote") + " on " +
+      shortHex(targetHex, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "react",
+      fee: fee,
+      label: (choice === 1 ? "▲ upvote" : "▼ downvote") + " on " + shortHex(targetHex, 10, 6),
+    });
     refreshMe();
     forceFeedRefresh();
   } else {
@@ -2005,6 +2380,7 @@ async function votePoll(pollTx, idx, optText) {
     okClass: "primary",
   });
   if (!ok) return;
+  toast("Sending vote…", "ok");
   const msg = optText.slice(0, 64) || "vote";
   const fee = await liveFee(utf8Bytes(msg));
   const r = await apiPost("/wallet/send", {
@@ -2024,7 +2400,17 @@ async function votePoll(pollTx, idx, optText) {
       set.add(pollTx);
       sessionStorage.setItem("mc.wallet.voted-polls", JSON.stringify([...set]));
     } catch (_) {}
-    toast("Voted: " + optText, "ok");
+    // Stash the picked option locally so the results view highlights
+    // "your pick" before the next feed-poll surfaces the vote tx.
+    setMyPollPick(pollTx, idx);
+    toast("Sent ✓ voted “" + optText + "”", "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "vote",
+      fee: fee,
+      label: "“" + (optText.length > 40 ? optText.slice(0, 40) + "…" : optText) +
+        "” on " + shortHex(pollTx, 10, 6),
+    });
     refreshMe();
     forceFeedRefresh(r.data.result.tx_hash);
   } else {
@@ -2256,6 +2642,7 @@ function renderEntityHeader(entityId, e) {
 }
 
 async function reactUser(entityId, choice) {
+  toast(choice === 1 ? "Sending trust…" : "Sending distrust…", "ok");
   const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: entityId,
@@ -2264,7 +2651,14 @@ async function reactUser(entityId, choice) {
     fee: fee,
   });
   if (r.status === 200) {
-    toast((choice === 1 ? "Trust ▲ " : "Distrust ▼ ") + shortHex(entityId, 8, 6), "ok");
+    toast("Sent ✓ " + (choice === 1 ? "trust" : "distrust") + " on " +
+      shortHex(entityId, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "react",
+      fee: fee,
+      label: (choice === 1 ? "▲ trust" : "▼ distrust") + " on " + shortHex(entityId, 10, 6),
+    });
   } else {
     toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
@@ -2749,11 +3143,18 @@ $("xfer-submit").addEventListener("click", async () => {
     });
     if (!ok) return;
   }
+  toast("Sending transfer…", "ok");
   const r = await apiPost("/wallet/transfer", {
     recipient_id: to, amount: amount, fee: fee, include_pubkey: includePk,
   });
   if (r.status === 200) {
-    toast("Transfer sent: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    toast("Sent ✓ transfer " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "transfer",
+      fee: fee,
+      label: amount + " tokens → " + shortHex(to, 10, 6),
+    });
     $("xfer-to").value = "";
     $("xfer-to").dispatchEvent(new Event("input"));  // clears stale validation chip
     $("xfer-amount").value = "";
@@ -2770,9 +3171,16 @@ $("stake-submit").addEventListener("click", async () => {
   // Audit r58 #2: blank fee -> live auto-fee for "stake" kind.
   const fee = feeStr ? parseInt(feeStr) : await liveFee("stake");
   if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
+  toast("Sending stake…", "ok");
   const r = await apiPost("/wallet/stake", { amount: amount, fee: fee });
   if (r.status === 200) {
-    toast("Staked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    toast("Sent ✓ stake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "stake",
+      fee: fee,
+      label: "+" + amount + " stake",
+    });
     $("stake-amount").value = "";
     refreshWallet();
   } else {
@@ -2787,9 +3195,16 @@ $("unstake-submit").addEventListener("click", async () => {
   // Audit r58 #2: blank fee -> live auto-fee for "unstake" kind.
   const fee = feeStr ? parseInt(feeStr) : await liveFee("unstake");
   if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
+  toast("Sending unstake…", "ok");
   const r = await apiPost("/wallet/unstake", { amount: amount, fee: fee });
   if (r.status === 200) {
-    toast("Unstaked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    toast("Sent ✓ unstake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash,
+      kind: "unstake",
+      fee: fee,
+      label: "-" + amount + " stake",
+    });
     $("unstake-amount").value = "";
     refreshWallet();
   } else {
@@ -2815,9 +3230,16 @@ $("prop-submit").addEventListener("click", async () => {
     const pb = utf8Bytes(title) + utf8Bytes(desc);
     body.fee = await liveFee("propose", { payload_bytes: pb });
   }
+  toast("Opening proposal…", "ok");
   const r = await apiPost("/wallet/propose", body);
   if (r.status === 200) {
-    toast("Proposal opened: " + shortHex(r.data.result.proposal_id, 8, 6), "ok");
+    toast("Sent ✓ proposal " + shortHex(r.data.result.proposal_id, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: r.data.result.tx_hash || r.data.result.proposal_id,
+      kind: "propose",
+      fee: body.fee,
+      label: "proposal: " + (title.length > 50 ? title.slice(0, 50) + "…" : title),
+    });
     $("prop-title").value = "";
     $("prop-desc").value = "";
     $("prop-ref").value = "";
@@ -2830,11 +3252,18 @@ $("prop-submit").addEventListener("click", async () => {
 async function castVote(approve, pidOverride) {
   const pid = (pidOverride || $("vote-pid").value).trim();
   if (pid.length !== 64) { toast("Proposal id must be 64 hex chars", "err"); return; }
+  toast("Sending vote…", "ok");
   const r = await apiPost("/wallet/vote-proposal", {
     proposal_id: pid, approve: approve,
   });
   if (r.status === 200) {
-    toast("Vote " + (approve ? "YES" : "NO") + " cast on " + shortHex(pid, 8, 6), "ok");
+    toast("Sent ✓ vote " + (approve ? "YES" : "NO") + " on " + shortHex(pid, 8, 6), "ok");
+    pushTxHistory({
+      tx_hash: (r.data.result && (r.data.result.tx_hash || r.data.result.vote_tx_hash)) || pid,
+      kind: "vote-proposal",
+      fee: r.data.result && r.data.result.fee,
+      label: (approve ? "YES" : "NO") + " on " + shortHex(pid, 10, 6),
+    });
     // Clear the manual proposal-id form once the vote landed -- a
     // stale id sitting there after success looks like the action
     // didn't take.  Refresh the list so the row re-renders with a
@@ -3095,11 +3524,15 @@ async function refreshNode() {
   restoreComposerDraft();
   // Restore tab from URL hash if present (e.g. #wallet, #governance).
   const hash = window.location.hash;
-  const tabMatch = hash.match(/^#(feed|wallet|governance|identity|node)$/);
+  const tabMatch = hash.match(/^#(feed|wallet|activity|governance|identity|node)$/);
   if (tabMatch) switchTab(tabMatch[1]);
   setInterval(refreshChainStatus, 8000);
   setInterval(pollNewActivity, 12000);
   setInterval(refreshMe, 25000);
+  // Re-check pending tx status every 8s.  Cheap when nothing is
+  // pending (early return); flips the Activity row from "pending" to
+  // "confirmed" without forcing the user to switch tabs.
+  setInterval(pollPendingTxStatuses, 8000);
 })();
 </script>
 </body>
