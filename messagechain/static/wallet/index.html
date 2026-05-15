@@ -974,10 +974,13 @@ function getMyTxHistory() {
   (CURRENT_MESSAGES || []).forEach(m => {
     if (!m.tx_hash || m.entity_id !== YOU.entity_id) return;
     if (byHash.has(m.tx_hash)) {
-      // Local entry wins (has the fee) but flip status to confirmed
-      // since the feed proves it landed.
+      // Local entry wins, but flip to confirmed since the feed proves
+      // the tx landed.  Also backfill `fee` from the feed entry if our
+      // local row was missing it (e.g. orphaned synth row that never
+      // got finalized cleanly).
       const row = byHash.get(m.tx_hash);
       if (row.status !== "confirmed") row.status = "confirmed";
+      if ((row.fee == null) && m.fee != null) row.fee = m.fee;
       return;
     }
     let kind = m.kind || "message";
@@ -998,7 +1001,7 @@ function getMyTxHistory() {
     byHash.set(m.tx_hash, {
       tx_hash: m.tx_hash,
       kind: kind,
-      fee: null,
+      fee: m.fee != null ? m.fee : null,
       label: label,
       entity_id: YOU.entity_id,
       submitted_at: m.timestamp || 0,
@@ -1187,7 +1190,8 @@ function renderActivity() {
     }
     const fee = document.createElement("span");
     fee.className = "fee";
-    fee.textContent = (r.fee != null) ? (r.fee + " fee") : "";
+    fee.textContent = (r.fee != null) ? (r.fee + " spent") : "";
+    fee.title = "Tokens this tx paid as a fee (its only on-chain cost)";
     const status = document.createElement("span");
     status.className = "status " + r.status;
     status.textContent = r.status;
@@ -2523,7 +2527,12 @@ async function openProfileModal(entityId) {
     const profile = (profR.status === 200 && profR.data && profR.data.ok)
       ? profR.data.result : null;
     body.innerHTML = "";
-    if (profile) body.appendChild(renderReputationBadge(profile));
+    // Reputation badge is rendered on EVERY profile, not just those
+    // with a usable /v1/profile payload -- a fresh wallet shows
+    // Reputation 0, a profile-fetch failure shows "—", but the field
+    // never disappears.  The activity-summary row only renders when
+    // we have profile data to summarize.
+    body.appendChild(renderReputationBadge(profile));
     body.appendChild(renderEntityHeader(entityId, e));
     if (profile) body.appendChild(renderProfileExtras(profile));
     // Filter the locally-fetched feed for messages from this entity.
@@ -2559,6 +2568,7 @@ async function openProfileModal(entityId) {
 // dominate by raw arithmetic; both factors must compound to score
 // well, which is the user-explicit reputation shape.
 function computeReputation(profile) {
+  if (!profile) return null;
   const since = profile.user_since && profile.user_since.block_number;
   const fees = profile.fees_paid || 0;
   if (!since || since < 0 || fees < 0) return null;
@@ -2567,6 +2577,11 @@ function computeReputation(profile) {
   return Math.floor(Math.sqrt(age * fees));
 }
 
+// Rendered on every profile, even when /v1/profile fails or the
+// entity has zero on-chain history -- a freshly-created wallet should
+// still see "Reputation 0" rather than the field disappearing.  When
+// the profile fetch failed entirely we render with score=null which
+// displays "—".
 function renderReputationBadge(profile) {
   const score = computeReputation(profile);
   const wrap = document.createElement("div");
@@ -2587,11 +2602,12 @@ function renderReputationBadge(profile) {
   const detail = document.createElement("span");
   detail.style.fontWeight = "400";
   detail.style.opacity = "0.85";
-  const since = profile.user_since && profile.user_since.block_number;
+  const since = profile && profile.user_since && profile.user_since.block_number;
   const age = since != null && LAST_HEIGHT
     ? (LAST_HEIGHT - since) + " blocks old"
     : "age unknown";
-  detail.textContent = "  ·  " + age + "  ·  " + (profile.fees_paid || 0) + " tokens spent";
+  const spent = (profile && profile.fees_paid) || 0;
+  detail.textContent = "  ·  " + age + "  ·  " + spent + " tokens spent";
   wrap.appendChild(star);
   wrap.appendChild(label);
   wrap.appendChild(s);
@@ -2658,7 +2674,7 @@ function renderEntityHeader(entityId, e) {
     if (!isSelf) {
       const tip = document.createElement("button");
       tip.className = "primary";
-      tip.textContent = "💸 send tokens";
+      tip.textContent = "Send tokens";
       tip.addEventListener("click", () => {
         closeModal();
         prefillTip((e && e.address) || entityId);
