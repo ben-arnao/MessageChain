@@ -1115,6 +1115,79 @@ function getMyTxHistory() {
   return combined;
 }
 
+// First-spend pubkey installer.  A freshly-created demo wallet has no
+// public key on chain until its first outbound tx carries one (see the
+// "Entity ... has no registered pubkey" gate in blockchain.py for every
+// signed tx kind that accepts include_pubkey).  Callers MUST forward
+// `include_pubkey: true` AND call markPubkeyInstalled() on success, so
+// subsequent writes in the same session don't try to re-install (the
+// chain rejects already-registered duplicates).
+function firstSpendPubkey() {
+  return !!(YOU && YOU.pubkey_registered === false);
+}
+function markPubkeyInstalled() {
+  if (YOU) YOU.pubkey_registered = true;
+}
+
+// Tx schemas that don't carry a sender_pubkey field (react, governance
+// propose, governance vote) cannot install the pubkey themselves.  If
+// the user triggers one of those BEFORE a message/transfer/stake has
+// registered the pubkey, the chain rejects the tx.  Refuse pre-emptively
+// with a clear toast rather than letting the error roll through the
+// generic "<X> failed: ..." path.
+function requirePubkeyOrToast(actionLabel) {
+  if (!YOU) return false;
+  if (YOU.pubkey_registered === false) {
+    toast(
+      "Post a message or send a transfer first to register your wallet " +
+      "on chain — " + actionLabel + " can't carry the install.",
+      "err",
+    );
+    return false;
+  }
+  return true;
+}
+
+// ---- Optimistic pending Activity row ----------------------------------
+// A write tx takes a few seconds to sign (server-side WOTS+ leaf
+// derivation) before /wallet/* returns a real tx_hash.  Insert the row
+// in Activity > Pending the instant the user clicks, keyed by a
+// synthetic id; swap to the real tx_hash on success or drop it on
+// failure.  The user perceives every click as instantaneous regardless
+// of signing latency, and the same shape applies to every write path
+// (reply, top-level post, react, vote-poll, transfer, stake, unstake,
+// propose, vote-proposal).
+let _PENDING_SYNTH_SEQ = 0;
+function optimisticPending(kind, label) {
+  if (!YOU || !YOU.entity_id) return null;
+  _PENDING_SYNTH_SEQ += 1;
+  const syntheticId = "synth-" + Date.now().toString(36) + "-" + _PENDING_SYNTH_SEQ;
+  pushTxHistory({
+    tx_hash: syntheticId, kind: kind, label: label, status: "pending",
+  });
+  return syntheticId;
+}
+function finalizePending(syntheticId, realTxHash, fee, extra) {
+  if (!syntheticId) return;
+  const arr = _lsGet(TX_HISTORY_KEY, []);
+  const idx = arr.findIndex(e => e.tx_hash === syntheticId);
+  if (idx < 0) return;
+  arr[idx].tx_hash = realTxHash;
+  if (fee != null) arr[idx].fee = fee;
+  if (extra && typeof extra === "object") Object.assign(arr[idx], extra);
+  _lsSet(TX_HISTORY_KEY, arr);
+  renderActivityIfVisible();
+}
+function dropPending(syntheticId) {
+  if (!syntheticId) return;
+  const arr = _lsGet(TX_HISTORY_KEY, []);
+  const idx = arr.findIndex(e => e.tx_hash === syntheticId);
+  if (idx < 0) return;
+  arr.splice(idx, 1);
+  _lsSet(TX_HISTORY_KEY, arr);
+  renderActivityIfVisible();
+}
+
 function getMyReaction(tx_hash) {
   if (!YOU || !YOU.entity_id) return 0;
   const m = _lsGet(MY_REACTIONS_KEY, {});
@@ -1193,16 +1266,30 @@ function renderActivity() {
       const text = document.createTextNode(r.label + "  ");
       label.appendChild(text);
     }
-    const a = document.createElement("a");
-    a.href = "#tx-" + r.tx_hash;
-    a.textContent = shortHex(r.tx_hash, 10, 6);
-    a.title = r.tx_hash + "\nsubmitted " + formatTs(r.submitted_at);
-    a.addEventListener("click", e => {
-      e.preventDefault();
-      window.location.hash = "tx-" + r.tx_hash;
-      switchTab("feed");
-    });
-    label.appendChild(a);
+    // Synthetic ids (synth-*) are local placeholders inserted at click
+    // time; the real tx_hash only arrives after server-side signing
+    // completes.  Render those as a non-clickable "signing…" pill so
+    // clicking them doesn't navigate to a #tx-synth-... permalink the
+    // feed can't resolve.
+    const isSynth = typeof r.tx_hash === "string" && r.tx_hash.startsWith("synth-");
+    if (isSynth) {
+      const span = document.createElement("span");
+      span.textContent = "signing…";
+      span.title = "Waiting for /wallet/* RPC to return a real tx_hash";
+      span.className = "tx-link synth";
+      label.appendChild(span);
+    } else {
+      const a = document.createElement("a");
+      a.href = "#tx-" + r.tx_hash;
+      a.textContent = shortHex(r.tx_hash, 10, 6);
+      a.title = r.tx_hash + "\nsubmitted " + formatTs(r.submitted_at);
+      a.addEventListener("click", e => {
+        e.preventDefault();
+        window.location.hash = "tx-" + r.tx_hash;
+        switchTab("feed");
+      });
+      label.appendChild(a);
+    }
     const fee = document.createElement("span");
     fee.className = "fee";
     fee.textContent = (r.fee != null) ? (r.fee + " fee") : "";
@@ -1241,7 +1328,13 @@ function renderActivity() {
 // counts as confirmed, even if the tx_status RPC is slow.
 async function pollPendingTxStatuses() {
   if (!YOU || !YOU.entity_id) return;
-  const pending = getMyTxHistory().filter(r => r.status === "pending");
+  // Skip synthetic placeholders -- those have no real tx_hash yet; the
+  // /v1/tx_status RPC can't answer for them and would just 404-spam.
+  const pending = getMyTxHistory().filter(
+    r => r.status === "pending"
+      && typeof r.tx_hash === "string"
+      && !r.tx_hash.startsWith("synth-"),
+  );
   if (pending.length === 0) return;
   for (const row of pending) {
     try {
@@ -1545,6 +1638,11 @@ composerPost.addEventListener("click", async () => {
   clearComposerDraft();
   updateComposerMeta();
   toast(isPoll ? "Opening poll…" : "Sending post…", "ok");
+  const composerLabel = isPoll
+    ? "poll: " + (text.length > 50 ? text.slice(0, 50) + "…" : text)
+    : (text.length > 60 ? text.slice(0, 60) + "…" : text);
+  const pendingId = optimisticPending(isPoll ? "poll" : "message", composerLabel);
+  const installPk = firstSpendPubkey();
   function restoreComposer() {
     composerText.value = savedText;
     composerCommunity.value = savedCommunity;
@@ -1568,23 +1666,22 @@ composerPost.addEventListener("click", async () => {
       // higher floor when posting one.
       body.fee = Math.max(body.fee, 500);
     }
+    if (installPk) body.include_pubkey = true;
     const r = await apiPost("/wallet/send", body);
     if (r.status === 200) {
+      if (installPk) markPubkeyInstalled();
+      finalizePending(pendingId, r.data.result.tx_hash, body.fee);
       toast((isPoll ? "Poll opened ✓ " : "Sent ✓ ") +
         shortHex(r.data.result.tx_hash, 8, 6), "ok");
-      pushTxHistory({
-        tx_hash: r.data.result.tx_hash,
-        kind: isPoll ? "poll" : "message",
-        fee: body.fee,
-        label: text.length > 60 ? text.slice(0, 60) + "…" : text,
-      });
       refreshMe();
     } else {
+      dropPending(pendingId);
       restoreComposer();
       toast("Send failed: " +
         ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
     }
   } catch (e) {
+    dropPending(pendingId);
     restoreComposer();
     toast("Send failed: " + (e && e.message || "network error"), "err");
   } finally {
@@ -2295,12 +2392,12 @@ function makeInlineReply(tx_hash) {
   });
   post.disabled = true;
 
-  // Fire-and-forget: as soon as the local-wallet RPC returns we toast
-  // "sent" and close the form -- we deliberately do NOT wait for the
-  // tx to land in a block, since signing alone (WOTS+ leaf
-  // derivation) can take several seconds and the user perceives the
-  // form as "hanging" through that window.  The next periodic poll
-  // (every 12s) will surface the reply in the feed.
+  // Fire-and-forget: close the form + insert a synthetic Pending row +
+  // toast "sending" the INSTANT the user clicks.  We deliberately do
+  // NOT wait for the tx to land in a block, and we don't even block on
+  // signing for the Activity row -- the synthetic-id row swaps to the
+  // real tx_hash when /wallet/send returns, and the next periodic poll
+  // (every 12s) flips it from pending to confirmed once it surfaces.
   post.addEventListener("click", async () => {
     const text = ta.value.trim();
     if (!text) return;
@@ -2310,22 +2407,22 @@ function makeInlineReply(tx_hash) {
     meta.textContent = "0 bytes";
     lastFeeBytes = -1;
     post.disabled = true;
+    const label = "reply: " + (text.length > 50 ? text.slice(0, 50) + "…" : text);
+    const pendingId = optimisticPending("message", label);
+    const installPk = firstSpendPubkey();
     toast("Sending reply…", "ok");
     try {
       const fee = await liveFee(utf8Bytes(text));
-      const r = await apiPost("/wallet/send", {
-        message: text, fee: fee, prev: tx_hash,
-      });
+      const body = { message: text, fee: fee, prev: tx_hash };
+      if (installPk) body.include_pubkey = true;
+      const r = await apiPost("/wallet/send", body);
       if (r.status === 200) {
+        if (installPk) markPubkeyInstalled();
+        finalizePending(pendingId, r.data.result.tx_hash, fee);
         toast("Sent ✓ " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-        pushTxHistory({
-          tx_hash: r.data.result.tx_hash,
-          kind: "message",
-          fee: fee,
-          label: "reply: " + (text.length > 50 ? text.slice(0, 50) + "…" : text),
-        });
         refreshMe();
       } else {
+        dropPending(pendingId);
         // Restore the user's text so they can edit and retry.
         ta.value = savedText;
         wrap.classList.add("open");
@@ -2334,6 +2431,7 @@ function makeInlineReply(tx_hash) {
           ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
       }
     } catch (e) {
+      dropPending(pendingId);
       ta.value = savedText;
       wrap.classList.add("open");
       refreshReplyMeta();
@@ -2391,7 +2489,18 @@ async function liveFee(kindOrBytes, opts) {
 }
 
 async function react(targetHex, choice) {
-  toast(choice === 1 ? "Sending upvote…" : "Sending downvote…", "ok");
+  // React txs don't carry a sender_pubkey field, so they can't install
+  // a fresh wallet's pubkey on chain.  Refuse pre-emptively if the
+  // wallet hasn't posted a message/transfer/stake yet -- the chain
+  // would reject this with "Entity ... has no registered pubkey".
+  const verb = choice === 1 ? "upvote" : "downvote";
+  if (!requirePubkeyOrToast(verb)) return;
+  // Optimistic highlight + pending row the instant the user clicks --
+  // signing takes a few seconds before the real tx_hash arrives.
+  setMyReaction(targetHex, choice);
+  const label = (choice === 1 ? "▲ upvote" : "▼ downvote") + " on " + shortHex(targetHex, 10, 6);
+  const pendingId = optimisticPending("react", label);
+  toast("Sending " + verb + "…", "ok");
   const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: targetHex,
@@ -2400,22 +2509,15 @@ async function react(targetHex, choice) {
     fee: fee,
   });
   if (r.status === 200) {
-    // Stash the choice locally so the arrow stays highlighted between
-    // now and the next feed-poll round trip.  Authoritative state will
-    // arrive once the react tx surfaces, but the highlight should feel
-    // instant on click.
-    setMyReaction(targetHex, choice);
-    toast("Sent ✓ " + (choice === 1 ? "upvote" : "downvote") + " on " +
-      shortHex(targetHex, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "react",
-      fee: fee,
-      label: (choice === 1 ? "▲ upvote" : "▼ downvote") + " on " + shortHex(targetHex, 10, 6),
-    });
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
+    toast("Sent ✓ " + verb + " on " + shortHex(targetHex, 8, 6), "ok");
     refreshMe();
     forceFeedRefresh();
   } else {
+    dropPending(pendingId);
+    // Roll back the optimistic local-cache highlight so the arrow
+    // doesn't stay lit on a tx that the chain rejected.
+    setMyReaction(targetHex, 0);
     toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
@@ -2431,15 +2533,22 @@ async function votePoll(pollTx, idx, optText) {
     okClass: "primary",
   });
   if (!ok) return;
-  toast("Sending vote…", "ok");
   const msg = optText.slice(0, 64) || "vote";
+  const label = "“" + (optText.length > 40 ? optText.slice(0, 40) + "…" : optText) +
+    "” on " + shortHex(pollTx, 10, 6);
+  const pendingId = optimisticPending("vote", label);
+  const installPk = firstSpendPubkey();
+  toast("Sending vote…", "ok");
   const fee = await liveFee(utf8Bytes(msg));
-  const r = await apiPost("/wallet/send", {
+  const body = {
     message: msg,
     fee: fee,
     vote_target: [pollTx, idx],
-  });
+  };
+  if (installPk) body.include_pubkey = true;
+  const r = await apiPost("/wallet/send", body);
   if (r.status === 200) {
+    if (installPk) markPubkeyInstalled();
     // Track the just-voted poll locally so the option buttons on
     // this poll's card disable immediately on the next render --
     // the vote tx itself takes a few seconds to land in a block,
@@ -2454,17 +2563,12 @@ async function votePoll(pollTx, idx, optText) {
     // Stash the picked option locally so the results view highlights
     // "your pick" before the next feed-poll surfaces the vote tx.
     setMyPollPick(pollTx, idx);
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
     toast("Sent ✓ voted “" + optText + "”", "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "vote",
-      fee: fee,
-      label: "“" + (optText.length > 40 ? optText.slice(0, 40) + "…" : optText) +
-        "” on " + shortHex(pollTx, 10, 6),
-    });
     refreshMe();
     forceFeedRefresh(r.data.result.tx_hash);
   } else {
+    dropPending(pendingId);
     toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
@@ -2693,7 +2797,11 @@ function renderEntityHeader(entityId, e) {
 }
 
 async function reactUser(entityId, choice) {
-  toast(choice === 1 ? "Sending trust…" : "Sending distrust…", "ok");
+  const verb = choice === 1 ? "trust" : "distrust";
+  if (!requirePubkeyOrToast(verb)) return;
+  const label = (choice === 1 ? "▲ trust" : "▼ distrust") + " on " + shortHex(entityId, 10, 6);
+  const pendingId = optimisticPending("react", label);
+  toast("Sending " + verb + "…", "ok");
   const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: entityId,
@@ -2702,15 +2810,10 @@ async function reactUser(entityId, choice) {
     fee: fee,
   });
   if (r.status === 200) {
-    toast("Sent ✓ " + (choice === 1 ? "trust" : "distrust") + " on " +
-      shortHex(entityId, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "react",
-      fee: fee,
-      label: (choice === 1 ? "▲ trust" : "▼ distrust") + " on " + shortHex(entityId, 10, 6),
-    });
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
+    toast("Sent ✓ " + verb + " on " + shortHex(entityId, 8, 6), "ok");
   } else {
+    dropPending(pendingId);
     toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
@@ -3194,23 +3297,28 @@ $("xfer-submit").addEventListener("click", async () => {
     });
     if (!ok) return;
   }
+  const label = amount + " tokens → " + shortHex(to, 10, 6);
+  const pendingId = optimisticPending("transfer", label);
+  // The transfer form has its own first-spend checkbox (includePk) so
+  // we don't override it here -- but if the user unchecked it on a
+  // never-registered wallet we still flip include_pubkey on, since the
+  // chain would reject the tx and the only correct behavior is to
+  // install the pubkey on the very first outbound.
+  const wantInstall = includePk || firstSpendPubkey();
   toast("Sending transfer…", "ok");
   const r = await apiPost("/wallet/transfer", {
-    recipient_id: to, amount: amount, fee: fee, include_pubkey: includePk,
+    recipient_id: to, amount: amount, fee: fee, include_pubkey: wantInstall,
   });
   if (r.status === 200) {
+    if (wantInstall) markPubkeyInstalled();
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
     toast("Sent ✓ transfer " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "transfer",
-      fee: fee,
-      label: amount + " tokens → " + shortHex(to, 10, 6),
-    });
     $("xfer-to").value = "";
     $("xfer-to").dispatchEvent(new Event("input"));  // clears stale validation chip
     $("xfer-amount").value = "";
     refreshWallet();
   } else {
+    dropPending(pendingId);
     toast("Transfer failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 });
@@ -3222,19 +3330,20 @@ $("stake-submit").addEventListener("click", async () => {
   // Audit r58 #2: blank fee -> live auto-fee for "stake" kind.
   const fee = feeStr ? parseInt(feeStr) : await liveFee("stake");
   if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
+  const pendingId = optimisticPending("stake", "+" + amount + " stake");
+  const installPk = firstSpendPubkey();
   toast("Sending stake…", "ok");
-  const r = await apiPost("/wallet/stake", { amount: amount, fee: fee });
+  const body = { amount: amount, fee: fee };
+  if (installPk) body.include_pubkey = true;
+  const r = await apiPost("/wallet/stake", body);
   if (r.status === 200) {
+    if (installPk) markPubkeyInstalled();
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
     toast("Sent ✓ stake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "stake",
-      fee: fee,
-      label: "+" + amount + " stake",
-    });
     $("stake-amount").value = "";
     refreshWallet();
   } else {
+    dropPending(pendingId);
     toast("Stake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 });
@@ -3246,19 +3355,18 @@ $("unstake-submit").addEventListener("click", async () => {
   // Audit r58 #2: blank fee -> live auto-fee for "unstake" kind.
   const fee = feeStr ? parseInt(feeStr) : await liveFee("unstake");
   if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
+  // Unstaking requires already-staked tokens, which requires an
+  // already-registered pubkey -- so no first-spend wiring needed.
+  const pendingId = optimisticPending("unstake", "-" + amount + " stake");
   toast("Sending unstake…", "ok");
   const r = await apiPost("/wallet/unstake", { amount: amount, fee: fee });
   if (r.status === 200) {
+    finalizePending(pendingId, r.data.result.tx_hash, fee);
     toast("Sent ✓ unstake " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash,
-      kind: "unstake",
-      fee: fee,
-      label: "-" + amount + " stake",
-    });
     $("unstake-amount").value = "";
     refreshWallet();
   } else {
+    dropPending(pendingId);
     toast("Unstake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 });
@@ -3281,21 +3389,26 @@ $("prop-submit").addEventListener("click", async () => {
     const pb = utf8Bytes(title) + utf8Bytes(desc);
     body.fee = await liveFee("propose", { payload_bytes: pb });
   }
+  // Proposal txs don't carry a sender_pubkey field, so a fresh wallet
+  // must register itself via a message/transfer/stake first.
+  if (!requirePubkeyOrToast("opening a proposal")) return;
+  const propLabel = "proposal: " + (title.length > 50 ? title.slice(0, 50) + "…" : title);
+  const pendingId = optimisticPending("propose", propLabel);
   toast("Opening proposal…", "ok");
   const r = await apiPost("/wallet/propose", body);
   if (r.status === 200) {
+    finalizePending(
+      pendingId,
+      r.data.result.tx_hash || r.data.result.proposal_id,
+      body.fee,
+    );
     toast("Sent ✓ proposal " + shortHex(r.data.result.proposal_id, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: r.data.result.tx_hash || r.data.result.proposal_id,
-      kind: "propose",
-      fee: body.fee,
-      label: "proposal: " + (title.length > 50 ? title.slice(0, 50) + "…" : title),
-    });
     $("prop-title").value = "";
     $("prop-desc").value = "";
     $("prop-ref").value = "";
     $("prop-fee").value = "";
   } else {
+    dropPending(pendingId);
     toast("Propose failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 });
@@ -3303,18 +3416,19 @@ $("prop-submit").addEventListener("click", async () => {
 async function castVote(approve, pidOverride) {
   const pid = (pidOverride || $("vote-pid").value).trim();
   if (pid.length !== 64) { toast("Proposal id must be 64 hex chars", "err"); return; }
+  // Governance votes don't carry sender_pubkey either.
+  if (!requirePubkeyOrToast("voting on a proposal")) return;
+  const voteLabel = (approve ? "YES" : "NO") + " on " + shortHex(pid, 10, 6);
+  const pendingId = optimisticPending("vote-proposal", voteLabel);
   toast("Sending vote…", "ok");
   const r = await apiPost("/wallet/vote-proposal", {
     proposal_id: pid, approve: approve,
   });
   if (r.status === 200) {
+    const realHash = (r.data.result && (r.data.result.tx_hash || r.data.result.vote_tx_hash)) || pid;
+    const realFee = r.data.result && r.data.result.fee;
+    finalizePending(pendingId, realHash, realFee);
     toast("Sent ✓ vote " + (approve ? "YES" : "NO") + " on " + shortHex(pid, 8, 6), "ok");
-    pushTxHistory({
-      tx_hash: (r.data.result && (r.data.result.tx_hash || r.data.result.vote_tx_hash)) || pid,
-      kind: "vote-proposal",
-      fee: r.data.result && r.data.result.fee,
-      label: (approve ? "YES" : "NO") + " on " + shortHex(pid, 10, 6),
-    });
     // Clear the manual proposal-id form once the vote landed -- a
     // stale id sitting there after success looks like the action
     // didn't take.  Refresh the list so the row re-renders with a
@@ -3322,6 +3436,7 @@ async function castVote(approve, pidOverride) {
     if (!pidOverride) $("vote-pid").value = "";
     refreshProposals();
   } else {
+    dropPending(pendingId);
     toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
