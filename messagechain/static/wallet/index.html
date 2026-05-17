@@ -3270,6 +3270,19 @@ async function refreshIdentity() {
   await refreshChainStatus();
   const t = bootstrapToken();
   if (!t && WALLET_MODE !== "public") {
+    // LOCAL-mode wallet with no session token in the URL: there is
+    // nothing the UI can do.  Drop the composer + write-only forms,
+    // surface a clear "no session" pill instead of leaving the page in
+    // its half-loaded default state, and toast the operator-facing
+    // restart hint.
+    document.body.classList.add("readonly");
+    const youMode = $("you-mode");
+    if (youMode) {
+      youMode.textContent = "no session";
+      youMode.className = "pill error";
+    }
+    const composer = $("composer");
+    if (composer) composer.style.display = "none";
     toast("No session token in URL.  Restart with `messagechain ui`.", "err");
     return;
   }
