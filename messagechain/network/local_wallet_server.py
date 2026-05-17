@@ -1717,21 +1717,43 @@ def build_wallet_server_faucet(
     from messagechain.core.transfer import create_transfer_transaction
     from messagechain.network.faucet import FaucetState, FAUCET_DRIP
 
-    # Load keyfile (raw 64-char hex, daemon-format; same shape
-    # _build_faucet on server.py expects).
+    # Accept either the user-facing keyfile format (72-char checksummed
+    # hex or 24-word mnemonic; what `messagechain generate-key` writes
+    # and what every other operator-facing CLI consumes via
+    # `decode_private_key`) OR the daemon-format raw 64-char hex that
+    # `server.py`'s `_build_faucet` historically expected.  Operators
+    # shouldn't have to know about two formats just because the faucet
+    # loader was the odd one out.
+    from messagechain.identity.key_encoding import (
+        decode_private_key,
+        InvalidKeyFormatError,
+        InvalidKeyChecksumError,
+    )
     with open(faucet_keyfile_path) as kf:
-        hex_key = kf.read().strip()
+        raw_text = kf.read().strip()
+    private_key: Optional[bytes] = None
     try:
-        private_key = bytes.fromhex(hex_key)
-    except ValueError as e:
+        private_key = decode_private_key(raw_text)
+    except InvalidKeyChecksumError as e:
         raise SystemExit(
-            f"--faucet-keyfile {faucet_keyfile_path}: not valid hex ({e})"
+            f"--faucet-keyfile {faucet_keyfile_path}: {e}"
         )
-    if len(private_key) != 32:
-        raise SystemExit(
-            f"--faucet-keyfile {faucet_keyfile_path}: expected 64 hex "
-            f"chars / 32 raw bytes, got {len(hex_key)} chars"
-        )
+    except InvalidKeyFormatError:
+        # Fall back to raw 64-char hex (daemon format).
+        try:
+            candidate = bytes.fromhex(raw_text)
+        except ValueError as e:
+            raise SystemExit(
+                f"--faucet-keyfile {faucet_keyfile_path}: not a 24-word "
+                f"mnemonic, 72-char checksummed hex, or 64-char raw hex "
+                f"({e})"
+            )
+        if len(candidate) != 32:
+            raise SystemExit(
+                f"--faucet-keyfile {faucet_keyfile_path}: expected 32 "
+                f"raw bytes, got {len(candidate)}"
+            )
+        private_key = candidate
 
     # Probe chain for recorded tree height; default to 16.
     probe_eid = Entity.create(private_key, tree_height=4).entity_id
