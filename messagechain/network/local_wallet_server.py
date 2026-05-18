@@ -94,7 +94,7 @@ __all__ = [
 # trying out the chain; SERIOUSLY UNDERPOWERED for a long-lived
 # wallet.  The Create Account warning modal tells users this and
 # points them at the README's offline-keygen workflow for real use.
-DEMO_ACCOUNT_TREE_HEIGHT = 12
+DEMO_ACCOUNT_TREE_HEIGHT = 10
 
 
 # --- Multi-session entity store ---------------------------------------

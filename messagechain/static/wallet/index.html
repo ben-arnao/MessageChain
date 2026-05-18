@@ -3031,15 +3031,17 @@ function downloadKeyfile(entity_id_hex, hex_or_mnemonic, ascii_blob) {
 // The single server call atomically does keygen -> faucet drip submit
 // -> session mint.  Stage timings match the real server-side cost
 // breakdown so the visible label tracks what's actually happening:
-//   * Keygen is the long one -- 4096 WOTS+ leaves takes 2-3 seconds
-//     on the demo deployment's small VM.
+//   * Keygen is the slowest step -- 1024 WOTS+ leaves at h=10 takes
+//     ~700-900ms on the demo deployment's small VM (was 2-3s at h=12;
+//     halved twice by dropping the tree height, still 1024 sigs which
+//     is far more than a demo wallet ever burns).
 //   * Faucet drip + session mint complete in a few hundred ms once
 //     keygen returns.
 // The last stage holds indefinitely so if the wait runs over budget
 // it doesn't snap back to a previous label.
 const _MINTER_STAGES = [
-  { label: "Generating your key…",       duration: 2500 },
-  { label: "Funding from the faucet…",   duration:  700 },
+  { label: "Generating your key…",       duration:  900 },
+  { label: "Funding from the faucet…",   duration:  500 },
   { label: "Signing you in…",            duration: Infinity },
 ];
 let _minterTimer = null;
