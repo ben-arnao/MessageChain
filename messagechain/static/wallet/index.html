@@ -3029,32 +3029,43 @@ function downloadKeyfile(entity_id_hex, hex_or_mnemonic, ascii_blob) {
 
 // Minter loader: shown while /wallet/create-account is in flight.
 // The single server call atomically does keygen -> faucet drip submit
-// -> session mint, so the stage labels are sequenced UX (not real
-// progress events) -- but the labels are honest about what the server
-// is doing during the wait.
+// -> session mint.  Stage timings match the real server-side cost
+// breakdown so the visible label tracks what's actually happening:
+//   * Keygen is the long one -- 4096 WOTS+ leaves takes 2-3 seconds
+//     on the demo deployment's small VM.
+//   * Faucet drip + session mint complete in a few hundred ms once
+//     keygen returns.
+// The last stage holds indefinitely so if the wait runs over budget
+// it doesn't snap back to a previous label.
 const _MINTER_STAGES = [
-  "Generating your key…",
-  "Funding from the faucet…",
-  "Signing you in…",
+  { label: "Generating your key…",       duration: 2500 },
+  { label: "Funding from the faucet…",   duration:  700 },
+  { label: "Signing you in…",            duration: Infinity },
 ];
 let _minterTimer = null;
 function showMinterLoader() {
   const bd = $("minter-backdrop");
   const stage = $("minter-stage");
   if (!bd || !stage) return;
-  stage.textContent = _MINTER_STAGES[0];
+  stage.textContent = _MINTER_STAGES[0].label;
   bd.classList.add("open");
+  if (_minterTimer) { clearTimeout(_minterTimer); _minterTimer = null; }
   let idx = 0;
-  if (_minterTimer) clearInterval(_minterTimer);
-  _minterTimer = setInterval(() => {
-    idx = Math.min(idx + 1, _MINTER_STAGES.length - 1);
-    stage.textContent = _MINTER_STAGES[idx];
-  }, 700);
+  function advance() {
+    if (idx >= _MINTER_STAGES.length - 1) return;
+    idx += 1;
+    stage.textContent = _MINTER_STAGES[idx].label;
+    const next = _MINTER_STAGES[idx].duration;
+    if (next !== Infinity) {
+      _minterTimer = setTimeout(advance, next);
+    }
+  }
+  _minterTimer = setTimeout(advance, _MINTER_STAGES[0].duration);
 }
 function hideMinterLoader() {
   const bd = $("minter-backdrop");
   if (_minterTimer) {
-    clearInterval(_minterTimer);
+    clearTimeout(_minterTimer);
     _minterTimer = null;
   }
   if (bd) bd.classList.remove("open");
