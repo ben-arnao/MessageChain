@@ -4,6 +4,74 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.87.0] — 2026-05-17
+
+Wallet UI iterations 6 → 7i + the trailing public-deployment readiness
+fixes.  No consensus changes; pure end-user surface polish plus a
+small server-side additive field (per-tx `fee` in feed entries) and
+two operator-facing bug fixes (LOCAL-no-token cleanup, faucet keyfile
+loader format-permissive).
+
+### Added
+
+* **Activity tab** — separate Pending + All Transactions panels.
+  Local UI submissions land as synthetic-id Pending rows the instant
+  the user clicks; swap to the real `tx_hash` when the wallet RPC
+  returns; flip to confirmed when the feed surfaces the tx or
+  `/v1/tx_status` reports inclusion.  Same shape on every write path
+  (reply, top-level post, react, vote-poll, transfer).  Drops the
+  perceived "click did nothing" gap during the 1–3s server-side
+  WOTS+ signing window.
+* **Create Account flow** for `--public` deployments — faucet-funded
+  demo wallets minted entirely from the browser, including a warning
+  modal that points users at `messagechain generate-key` for real
+  wallets and a wall-of-fields confirmation modal with click-to-copy
+  on every field.
+* **Reputation badge** on every profile.  Formula unchanged from the
+  iteration 5 introduction (`floor(sqrt(age_blocks × fees_paid))`);
+  badge now renders for fresh wallets (score 0) and `/v1/profile`
+  fetch failures (score "—") instead of disappearing.
+* **First-spend pubkey auto-install** on every write path the chain
+  accepts `sender_pubkey` for (message, reply, vote-poll, stake,
+  transfer).  Refuses pre-emptively with a clear toast on react /
+  propose / vote-proposal when the wallet hasn't been registered yet
+  (those tx schemas don't carry `sender_pubkey`).
+* `fee` field on every entry returned by `get_recent_messages` and
+  `get_recent_messages_by_entity` — additive JSON, lets the wallet
+  UI render "tokens spent" on confirmed-tx Activity rows that came
+  from another device.
+
+### Changed
+
+* **Wallet UI scope is end-user only.**  Header pills for stake +
+  chain height, the Stake / Unstake panel in the Wallet tab, the
+  Governance tab (open proposals + new proposal + vote-on-proposal),
+  and the Node tab (chain id / tip hash / state root) are all
+  removed.  Server-side `/wallet/stake`, `/wallet/unstake`,
+  `/wallet/propose`, `/wallet/vote-proposal`, and `/v1/info` +
+  `/v1/proposals` HTTP routes still exist for the CLI to drive.
+* Tabs now: **Feed · Wallet (balance + send) · Activity · Identity**.
+* Send Tokens button on the profile modal drops its 💸 emoji.
+* Auto-fee path on every write surface routes through the unified
+  per-kind `/wallet/estimate-fee` RPC (was iter 5; carried forward).
+
+### Fixed
+
+* `build_wallet_server_faucet` now accepts the user-facing 72-char
+  checksummed-hex or 24-word-mnemonic keyfile format via
+  `decode_private_key`, falling back to raw 64-char hex (daemon
+  format) — pointing `--faucet-keyfile` at a keyfile that
+  `messagechain generate-key` wrote used to die with "expected 64
+  hex chars / 32 raw bytes, got 72 chars".
+* LOCAL-mode wallet UI opened at the bare URL (no `?t=`) no longer
+  leaves the composer + write-only panels visible.  The page now
+  flips `body.readonly`, shows a `no session` error pill, and hides
+  the composer alongside the existing "Restart with `messagechain
+  ui`" toast.
+* Activity rows for synthetic-id placeholders ("signing…") are no
+  longer queried against `/v1/tx_status` — saves a wasted RPC + a
+  spurious 404 entry in the server log per outstanding write.
+
 ## [1.86.0] — 2026-05-13
 
 Audit r58 top-3 ships alongside queued wallet-UI iterations 2–5 and
