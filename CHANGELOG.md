@@ -4,6 +4,76 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.88.0] — 2026-05-18
+
+Wallet-UI Create Account polish + a production-critical fix that
+unwedged validator block production.  No consensus changes.
+
+### Fixed
+
+* **Wallet-UI faucet now attaches a Merkle node cache.**  Production
+  hung on 2026-05-18: every `/wallet/create-account` request on
+  https://messagechain.org timed out and validator block production
+  stopped for ~40 minutes.  Root cause was a cascading slow-sign
+  deadlock — `build_wallet_server_faucet` loaded the faucet entity
+  via `load_or_create_personal_wallet_entity` but never attached a
+  Merkle node cache, so every faucet drip `sign()` recomputed the
+  full auth path from scratch (~2^15 leaves × ~67 hashes/leaf in pure
+  Python = ~20 seconds at the production faucet height h=16).  That
+  sign held the per-wallet leaf-cursor file lock for the entire 20s,
+  and because the co-resident validator daemon shares the same lock
+  file under the same `--data-dir`, its own block-production sign
+  blocked, hit the 30s `_LEAF_CURSOR_LOCK_TIMEOUT_S`, and raised
+  `LeafCursorLockTimeoutError`.  Concurrent create-account requests
+  also queued behind the same lock and timed out at the browser.
+  Fix attaches the node cache at wallet-UI startup so faucet `sign()`
+  is O(height) instead of O(2^height) — microseconds rather than tens
+  of seconds.  First startup pays a ~20s one-time cache build;
+  subsequent restarts load the persisted cache in ms.  The on-disk
+  cache filename embeds a private-key-keyed digest so faucet and
+  validator hot wallets land in distinct cache files within the same
+  data_dir.  Regression test in
+  `tests/test_wallet_server_faucet_node_cache.py` spies the
+  attach-node-cache call and fails loudly if the wiring is removed.
+  (`ce37c27`)
+* **Demo account post-mint modal simplified to address + collapsible
+  mnemonic.**  The previous wall-of-fields layout buried the
+  actionable next step (the address to share) under five repeated
+  copy-the-key warnings.  New layout: just the address visible by
+  default, mnemonic tucked behind a disclosure for power users who
+  want a second copy outside the downloaded keyfile.  (`f6e6458`)
+* **Minter loader stage labels retimed.**  Original loader cycled all
+  three stages at 700ms each, so users sat on "Signing you in…"
+  while the server was actually still mid-keygen.  Durations now
+  match real server-side cost breakdown — keygen takes the long
+  slice; faucet drip + session mint are sub-second; final stage
+  holds indefinitely so a longer-than-budget wait does not snap back
+  to a previous label.  (`5a292e3`)
+
+### Added
+
+* **Drip-tx watcher on Create Account.**  After the post-mint modal
+  closes, the UI polls `/v1/tx_status` for the faucet drip every
+  2.5s (60s budget) and refreshes the balance pill the moment the
+  tx is included, so the user sees real funds within seconds instead
+  of waiting up to the next periodic `refreshMe` (25s).  Best-effort
+  — silent on network blips.  (`68cb3a6`)
+* **Centered loader modal with staged labels** during Create Account.
+  Replaces the prior naked-feed frame between "click Create Account"
+  and the success modal.  Spinner + "Creating your demo wallet" title
+  + stage label that advances on a real-timing budget (see "Minter
+  loader stage labels retimed" above) + "keep this tab open" hint.
+  Hides exactly as the success modal opens — no flicker.  Failure
+  path hides the loader and surfaces a red error toast.  (`64ea732`)
+
+### Performance
+
+* **Demo-account tree height 12 → 10.**  4× faster Create Account
+  keygen on the public deployment's small VM (1024 vs 4096 WOTS+
+  leaves).  Demo wallets never burn anywhere near 1024 signatures
+  before the user discards the wallet, so the lower height is pure
+  UX win with no operator-visible downside.  (`c2aef5f`)
+
 ## [1.87.0] — 2026-05-17
 
 Wallet UI iterations 6 → 7i + the trailing public-deployment readiness
