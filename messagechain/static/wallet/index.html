@@ -3073,6 +3073,31 @@ function hideMinterLoader() {
   if (bd) bd.classList.remove("open");
 }
 
+// After Create Account closes, poll the drip tx until it's included
+// in a block so the balance pill updates within a few seconds instead
+// of waiting up to the next periodic refreshMe (25s).  Best-effort:
+// 60s budget, 2.5s cadence, silent on network blips.
+async function watchDripUntilConfirmed(txHash) {
+  if (!txHash) return;
+  const deadline = Date.now() + 60_000;
+  const tick = async () => {
+    if (Date.now() > deadline) return;
+    try {
+      const r = await api("/v1/tx_status?tx_hash=" + encodeURIComponent(txHash));
+      if (r.status === 200 && r.data && r.data.ok) {
+        const result = r.data.result || {};
+        if (result.status === "included") {
+          await refreshMe();
+          toast("✓ Faucet funds arrived — your wallet is ready to use.", "ok");
+          return;
+        }
+      }
+    } catch (_) { /* network blip; try again */ }
+    setTimeout(tick, 2500);
+  };
+  setTimeout(tick, 2500);
+}
+
 async function openCreateAccountModal() {
   // Two-step flow: warning + confirm, then mint.  The warning is
   // load-bearing -- "create account on the web" is a deliberately
@@ -3214,6 +3239,10 @@ async function openCreateAccountModal() {
   close.addEventListener("click", () => {
     closeModal();
     refreshMe().then(refreshFeed);
+    // Watch the faucet drip so the balance pill flips from "0 bal" to
+    // the funded amount within ~5s of block inclusion -- without this
+    // the user waits up to the periodic refreshMe cadence (25s).
+    if (d.drip_tx_hash) watchDripUntilConfirmed(d.drip_tx_hash);
   });
   actions.appendChild(close);
   body.appendChild(actions);
