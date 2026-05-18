@@ -72,7 +72,7 @@ import socketserver
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from messagechain.config import CHAIN_ID, PUBLIC_FEED_MAX_LIMIT
@@ -247,6 +247,11 @@ class _WalletHandlerContext:
         # validator.  Tests inject a fake to avoid spinning a real
         # validator just to exercise the wallet-side routing.
         self.rpc_caller = rpc_caller
+        # Trusted-proxy CIDR list for X-Forwarded-For / X-Real-IP
+        # resolution.  Set by LocalWalletServer.start(); initialized
+        # empty so tests that construct contexts directly get the safe
+        # default of "raw TCP source, ignore forwarded headers".
+        self.trusted_proxies: list = []
 
     def add_session(self, entity, duration_sec: int) -> str:
         """Mint a fresh session_id, register the entity against it, and
@@ -784,7 +789,22 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         #    the rate-limit + window-cap machinery /faucet uses
         #    (per-/24 cooldown, window cap) so an attacker cannot
         #    spam create-account to drain the faucet.
-        client_ip = self.client_address[0] if self.client_address else ""
+        #
+        #    Resolve client IP via _resolve_client_ip so a public-mode
+        #    deployment behind a TLS-terminating reverse proxy (Caddy
+        #    on messagechain.org) rate-limits each REAL browser by its
+        #    actual /24 instead of coalescing every user under the
+        #    proxy's loopback /24 -- which would let one user lock
+        #    every other user out of the per-/24 cooldown.  Empty
+        #    trusted_proxies list (default for personal installs) falls
+        #    back to the raw TCP source unchanged.
+        from messagechain.network.public_feed_server import (
+            _resolve_client_ip,
+        )
+        socket_peer = self.client_address[0] if self.client_address else ""
+        client_ip = _resolve_client_ip(
+            socket_peer, self.headers, ctx.trusted_proxies,
+        )
         drip = ctx.faucet.drip_for_quickpost(
             client_ip, new_entity.entity_id,
         )
@@ -1568,6 +1588,7 @@ class LocalWalletServer:
         data_dir: Optional[str] = None,
         public_mode: bool = False,
         faucet=None,
+        trusted_proxies: Optional[Iterable] = None,
     ):
         # Public mode RELAXES the loopback bind check -- the wallet UI
         # is intended to be deployable to messagechain.org as a single
@@ -1600,6 +1621,17 @@ class LocalWalletServer:
         # signing on the same key.  cmd_ui defaults this from the
         # global --data-dir flag.
         self.data_dir = data_dir
+        # CIDR allowlist of front-end reverse proxies (Caddy, nginx) the
+        # wallet server trusts to set X-Forwarded-For / X-Real-IP.  When
+        # non-empty, /wallet/create-account resolves the rate-limit
+        # bucket key from the rightmost forwarded token instead of the
+        # raw TCP source — so a public deployment behind a loopback
+        # proxy does NOT coalesce every real user into 127.0.0.0/24
+        # (which would let one user lock everyone else out of the
+        # faucet's per-/24 cooldown).  Empty list (default) preserves
+        # the legacy raw-TCP-source behavior for personal / no-proxy
+        # installs.  Matches the public_feed_server semantics exactly.
+        self.trusted_proxies: list = list(trusted_proxies or [])
         # Tests inject `rpc_caller` directly to bypass the actual RPC
         # round-trip.  In production we lazily wrap `client.rpc_call`
         # against `rpc_endpoint`.
@@ -1643,6 +1675,7 @@ class LocalWalletServer:
         )
         ctx.data_dir = self.data_dir
         ctx.faucet = self.faucet
+        ctx.trusted_proxies = self.trusted_proxies
         self._httpd._wallet_context = ctx
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

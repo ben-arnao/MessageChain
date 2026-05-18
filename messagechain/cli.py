@@ -1689,6 +1689,21 @@ def build_parser() -> argparse.ArgumentParser:
             "and POST /wallet/create-account returns 503."
         ),
     )
+    ui.add_argument(
+        "--trusted-proxies", type=str, default="",
+        help=(
+            "Comma-separated CIDR allowlist of front-end reverse "
+            "proxies the wallet UI trusts to set X-Forwarded-For (e.g. "
+            "'127.0.0.1/32' for a loopback Caddy/nginx terminating "
+            "TLS).  When set, /wallet/create-account resolves the "
+            "rate-limit bucket key from the rightmost X-Forwarded-For "
+            "token instead of the raw TCP source.  Without this flag, "
+            "every real user behind a loopback proxy coalesces into "
+            "the proxy's /24 (127.0.0.0/24) and one user trips the "
+            "faucet's per-/24 cooldown for everyone.  Mirror of the "
+            "same flag on `messagechain start`."
+        ),
+    )
 
     return parser
 
@@ -9245,6 +9260,17 @@ def cmd_ui(args):
                 sys.exit(1)
             print("Faucet ready: Create Account flow enabled.\n")
 
+    # Parse --trusted-proxies (comma-separated CIDR list).  Reuses the
+    # public_feed_server helper so the parsing rules + validation are
+    # byte-for-byte identical across the two HTTP surfaces.
+    trusted_proxies_arg = getattr(args, "trusted_proxies", "") or ""
+    trusted_proxies = None
+    if trusted_proxies_arg:
+        from messagechain.network.public_feed_server import (
+            _parse_trusted_proxies,
+        )
+        trusted_proxies = _parse_trusted_proxies(trusted_proxies_arg)
+
     try:
         server = LocalWalletServer(
             blockchain=None,
@@ -9256,10 +9282,17 @@ def cmd_ui(args):
             data_dir=getattr(args, "data_dir", None),
             public_mode=public_mode,
             faucet=faucet,
+            trusted_proxies=trusted_proxies,
         )
     except LoopbackBindError as e:
         print(f"Error: {e}")
         sys.exit(1)
+
+    if trusted_proxies:
+        print(
+            "Wallet UI honoring X-Forwarded-For from trusted proxies: "
+            + ", ".join(str(n) for n in trusted_proxies)
+        )
 
     server.start()
     if public_mode:
