@@ -505,6 +505,56 @@
   }
   .modal-backdrop.open .modal { transform: translateY(0); }
   .modal h2 { margin: 0 0 0.6rem; font-size: 1.1rem; }
+
+  /* Minter loader (Create Account progress).  Centered, non-dismissable
+     overlay; renders above every other modal (higher z-index than
+     .modal-backdrop). */
+  .minter-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+  }
+  .minter-backdrop.open { display: flex; }
+  .minter-card {
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    padding: 1.6rem 1.8rem;
+    max-width: 380px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+  }
+  .minter-spinner {
+    width: 42px;
+    height: 42px;
+    margin: 0 auto 0.9rem;
+    border-radius: 50%;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    animation: minter-spin 0.9s linear infinite;
+  }
+  @keyframes minter-spin { to { transform: rotate(360deg); } }
+  .minter-title {
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+  }
+  .minter-stage {
+    color: var(--accent);
+    font-size: 0.95rem;
+    margin-bottom: 0.6rem;
+    min-height: 1.3em;
+  }
+  .minter-hint {
+    color: var(--muted);
+    font-size: 0.82rem;
+  }
+
   .modal .close-row {
     display: flex;
     justify-content: flex-end;
@@ -798,6 +848,22 @@
     </div>
     <h2 id="modal-title">Profile</h2>
     <div id="modal-body"></div>
+  </div>
+</div>
+
+<!-- Create-account minter: non-dismissable centered loader shown for
+     the 1-3s window between the user confirming the warning modal and
+     /wallet/create-account returning the freshly-minted PK.  Stages
+     are timed UX (the server call is one atomic request -- there's no
+     intermediate progress to surface) but the labels match what the
+     server is actually doing: keygen, faucet drip submit, session
+     mint. -->
+<div class="minter-backdrop" id="minter-backdrop">
+  <div class="minter-card">
+    <div class="minter-spinner" aria-hidden="true"></div>
+    <div class="minter-title">Creating your demo wallet</div>
+    <div class="minter-stage" id="minter-stage">Generating your key…</div>
+    <div class="minter-hint">This takes a couple of seconds — keep this tab open.</div>
   </div>
 </div>
 
@@ -2961,6 +3027,39 @@ function downloadKeyfile(entity_id_hex, hex_or_mnemonic, ascii_blob) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// Minter loader: shown while /wallet/create-account is in flight.
+// The single server call atomically does keygen -> faucet drip submit
+// -> session mint, so the stage labels are sequenced UX (not real
+// progress events) -- but the labels are honest about what the server
+// is doing during the wait.
+const _MINTER_STAGES = [
+  "Generating your key…",
+  "Funding from the faucet…",
+  "Signing you in…",
+];
+let _minterTimer = null;
+function showMinterLoader() {
+  const bd = $("minter-backdrop");
+  const stage = $("minter-stage");
+  if (!bd || !stage) return;
+  stage.textContent = _MINTER_STAGES[0];
+  bd.classList.add("open");
+  let idx = 0;
+  if (_minterTimer) clearInterval(_minterTimer);
+  _minterTimer = setInterval(() => {
+    idx = Math.min(idx + 1, _MINTER_STAGES.length - 1);
+    stage.textContent = _MINTER_STAGES[idx];
+  }, 700);
+}
+function hideMinterLoader() {
+  const bd = $("minter-backdrop");
+  if (_minterTimer) {
+    clearInterval(_minterTimer);
+    _minterTimer = null;
+  }
+  if (bd) bd.classList.remove("open");
+}
+
 async function openCreateAccountModal() {
   // Two-step flow: warning + confirm, then mint.  The warning is
   // load-bearing -- "create account on the web" is a deliberately
@@ -2984,15 +3083,17 @@ async function openCreateAccountModal() {
 
   // Mint.  The server generates the PK + faucet-funds it + returns
   // the PK + an auto-signed-in session.
-  toast("Generating wallet…", "ok");
+  showMinterLoader();
   let r;
   try {
     r = await apiPost("/wallet/create-account", { duration_sec: 86400 });
   } catch (_) {
+    hideMinterLoader();
     toast("Create account failed -- network error", "err");
     return;
   }
   if (r.status !== 200 || !r.data || !r.data.ok) {
+    hideMinterLoader();
     toast(
       "Create account failed: " +
       ((r.data && r.data.error) || ("HTTP " + r.status)),
@@ -3075,6 +3176,10 @@ async function openCreateAccountModal() {
   });
   actions.appendChild(close);
   body.appendChild(actions);
+  // Hide the minter loader exactly when the success modal renders, so
+  // the transition looks like spinner -> success card (no flicker, no
+  // brief "naked feed" frame).
+  hideMinterLoader();
   showModal();
 }
 
