@@ -3140,9 +3140,14 @@ async function openCreateAccountModal() {
   // Stash the new session token so subsequent /wallet/* requests work.
   if (d.session_id) sessionStorage.setItem(TOKEN_KEY, d.session_id);
 
-  // Show a follow-up modal confirming the download + key info, so
-  // the user can copy the address / mnemonic visually if they want.
-  $("modal-title").textContent = "Demo wallet created";
+  // Post-mint summary: keep it minimal -- the user clicked Create
+  // Account, they want to start using the app, not stare at five
+  // click-to-copy fields including the raw private key.  The full key
+  // material (mnemonic + raw hex + entity_id) is in the .key file
+  // they just downloaded; the modal surfaces (a) backup reminder and
+  // (b) their address.  Power users who want to copy the mnemonic
+  // separately can expand the collapsible.
+  $("modal-title").textContent = "Your demo wallet is ready";
   const body = $("modal-body");
   body.innerHTML = "";
   const ok = document.createElement("div");
@@ -3150,9 +3155,12 @@ async function openCreateAccountModal() {
   ok.style.background = "var(--accent-bg)";
   ok.style.borderColor = "var(--accent)";
   ok.style.color = "var(--accent)";
-  ok.innerHTML = "✓ <strong>Wallet downloaded.</strong>  Check your " +
-    "browser's downloads folder for the <code>.key</code> file.";
+  ok.innerHTML =
+    "✓ <strong>Wallet downloaded.</strong>  Save the <code>.key</code> " +
+    "file somewhere safe — there's no recovery if you lose it.";
   body.appendChild(ok);
+
+  // Address row (sole always-visible field).
   function row(k, v) {
     const r = document.createElement("div");
     r.className = "field-row";
@@ -3166,23 +3174,43 @@ async function openCreateAccountModal() {
     return r;
   }
   body.appendChild(row("address", d.address));
-  body.appendChild(row("entity_id", d.entity_id));
-  if (d.mnemonic) body.appendChild(row("mnemonic", d.mnemonic));
-  body.appendChild(row("private key (hex)", d.private_key_hex));
-  if (d.drip_tx_hash) body.appendChild(row("faucet drip tx", d.drip_tx_hash));
+
+  // Collapsible recovery phrase -- intentionally extra-click to surface
+  // sensitive material.  Users who want their mnemonic in a password
+  // manager click through; everyone else relies on the keyfile.
+  if (d.mnemonic) {
+    const det = document.createElement("details");
+    det.style.margin = "0.8rem 0 0.4rem";
+    const sum = document.createElement("summary");
+    sum.style.cursor = "pointer";
+    sum.style.color = "var(--muted)";
+    sum.style.fontSize = "0.88rem";
+    sum.textContent = "Show recovery phrase (24 words)";
+    det.appendChild(sum);
+    const warn = document.createElement("div");
+    warn.className = "hint";
+    warn.style.margin = "0.5rem 0";
+    warn.style.color = "var(--warn)";
+    warn.textContent =
+      "Anyone with these words controls your wallet.  Treat them like " +
+      "a password.";
+    det.appendChild(warn);
+    det.appendChild(row("mnemonic", d.mnemonic));
+    body.appendChild(det);
+  }
+
   const note = document.createElement("p");
   note.className = "hint";
   note.style.marginTop = "0.7rem";
-  note.textContent = "You're signed in as this wallet.  Funds from " +
-    "the faucet will appear once the drip tx is included in a block " +
-    "(usually a few seconds).  Keep the .key file safe -- it's the " +
-    "only copy.";
+  note.textContent =
+    "You're signed in.  Faucet funds usually arrive within a few seconds.";
   body.appendChild(note);
+
   const actions = document.createElement("div");
   actions.className = "actions";
   const close = document.createElement("button");
   close.className = "primary";
-  close.textContent = "Got it";
+  close.textContent = "Start using MessageChain";
   close.addEventListener("click", () => {
     closeModal();
     refreshMe().then(refreshFeed);
