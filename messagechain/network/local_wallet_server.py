@@ -1781,6 +1781,21 @@ def build_wallet_server_faucet(
         "Faucet wallet loaded for create-account: %s", entity.entity_id_hex[:16],
     )
 
+    # Attach the Merkle node cache so the faucet's per-drip sign() is
+    # O(tree_height) instead of O(2^tree_height) auth-path recomputation.
+    # Without this, a single drip-sign at tree_height=16 takes ~20s on
+    # a small VM (≈2^15 leaves × ~67 hashes/leaf in pure Python), holds
+    # the leaf-cursor file lock for that entire window, hangs every
+    # subsequent /wallet/create-account request, AND stalls validator
+    # block production (which contends on the same shared lock file).
+    # Cache lives at <data_dir>/merkle_cache_<keydigest>.bin -- the
+    # filename is keyed on the faucet's private key so it never collides
+    # with the daemon's own hot-wallet cache in the same data_dir.
+    from messagechain.crypto.merkle_cache import attach_node_cache
+    attach_node_cache(
+        entity, private_key, tree_height, data_dir,
+    )
+
     # Pubkey-installed flag mirrors server.py _build_faucet -- avoid
     # repeated include_pubkey on subsequent drips (chain rejects).
     pubkey_known_installed = [False]
