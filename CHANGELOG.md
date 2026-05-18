@@ -4,6 +4,47 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.88.1] — 2026-05-18
+
+Hotfix to the 1.88.0 Create Account flow: wallet UI now honors
+``X-Forwarded-For`` from configured trusted proxies, so a public
+deployment behind a TLS-terminating reverse proxy stops coalescing
+every real user into the proxy's loopback /24.  No consensus changes.
+
+### Fixed
+
+* **``/wallet/create-account`` honors ``X-Forwarded-For`` from
+  trusted proxies.**  Same-day follow-up to the 1.88.0 unwedge:
+  with sign() finally fast enough for real users to actually try the
+  Create Account flow, a different bug surfaced -- the handler read
+  ``self.client_address[0]`` directly, which behind a loopback Caddy
+  proxy is always 127.0.0.1.  Every real browser visitor collapsed
+  into ``127.0.0.0/24``, so the faucet's per-/24 cooldown made one
+  successful Create Account lock out every other visitor for the full
+  ~14-minute cooldown window.  Fix mirrors the existing
+  ``public_feed_server`` semantics: ``LocalWalletServer`` takes a
+  ``trusted_proxies`` CIDR allowlist; when the socket peer falls
+  inside the allowlist, the rate-limit bucket key resolves to the
+  rightmost ``X-Forwarded-For`` token; malformed tokens land in the
+  sentinel "unattributable" bucket so attackers can't bucket-rotate
+  by sending garbage.  Untrusted-peer XFF is always ignored.
+  Regression tests in
+  ``tests/test_wallet_server_xff_client_ip.py`` cover the three
+  branches.  (`9f17533`)
+
+### Added
+
+* **``messagechain ui --trusted-proxies <cidr,cidr,...>``** flag.
+  Comma-separated CIDR list of front-end reverse proxies the wallet
+  UI trusts to set ``X-Forwarded-For``.  Parses via the same
+  ``_parse_trusted_proxies`` helper the daemon's
+  ``start --trusted-proxies`` uses.  Operator note: the
+  ``messagechain-wallet-ui`` systemd unit on a public deployment
+  needs ``--trusted-proxies 127.0.0.1/32`` added to its
+  ``ExecStart`` line for the new code path to take effect; without
+  the flag, the wallet UI keeps the legacy raw-TCP-source behavior
+  (correct default for personal installs).  (`9f17533`)
+
 ## [1.88.0] — 2026-05-18
 
 Wallet-UI Create Account polish + a production-critical fix that
