@@ -4,6 +4,108 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.88.2] — 2026-05-22
+
+Two same-day hotfixes for the public Create Account flow on
+messagechain.org -- iteration 7p UI polish + a Create Account
+sign-in correctness fix that unblocks signing back in with the
+downloaded ``.key`` file.  No consensus changes.
+
+### Fixed
+
+* **``/wallet/create-account`` now writes the personal-wallet
+  keypair cache, AND ``/wallet/login`` honors an optional
+  ``tree_height`` hint.**  A user with a freshly-downloaded
+  Create Account ``.key`` file (tree height 10) attempted to
+  sign back in.  Sign-in hung for several minutes and would have
+  signed them into the wrong wallet anyway.  Root cause was a
+  three-way pile-up in the sign-in path: (a) ``Entity.create``
+  on the create-account path never wrote the keypair cache so
+  no on-disk entry existed at h=10, (b)
+  ``load_or_create_personal_wallet_entity``'s candidate-height
+  probe only covered the legacy h=16 + h=20 (both miss), and
+  (c) the fall-through ``Entity.create`` at the production
+  ``MERKLE_TREE_HEIGHT`` = 20 burns ~1M WOTS+ leaves in pure
+  Python = several minutes on the validator VM AND produces a
+  DIFFERENT entity_id (the WOTS+ root depends on tree height).
+  Fix is three-part: Create Account routes through
+  ``load_or_create_personal_wallet_entity`` so the cache write
+  is a side-effect of the keygen; ``/wallet/login`` accepts an
+  optional ``tree_height`` hint and the SPA parses
+  ``# Tree height: N`` from an uploaded ``.key`` file's comment
+  header and passes it through; the no-hint candidate-probe in
+  ``load_or_create_personal_wallet_entity`` now starts at
+  ``DEMO_ACCOUNT_HEIGHT`` (10) before the legacy heights, so
+  even a paste-hex sign-in on a server with no SPA hint finds
+  the right cache.  Regression coverage in
+  ``tests/test_wallet_server_signin_tree_height_hint.py``.
+  (`d5580e4`)
+* **Sign-in button label no longer overpromises pain.**
+  ``"Signing in (may take minutes on first load)…"`` -> ``"Signing in…"``.
+  A hinted h=10 keyfile is sub-second; a cache hit at any height
+  is milliseconds; the only "minutes" case (cold ``MERKLE_TREE_HEIGHT``
+  keygen) is now unreachable on this deployment with the fix above.
+  (`d5580e4`)
+
+### Wallet UI polish (iteration 7p)
+
+A live-walkthrough pass that takes the messagechain.org SPA's
+edges down.  Eleven small fixes shipped as one commit
+([e5c8208](https://github.com/ben-arnao/MessageChain/commit/e5c8208)):
+
+* ``MessageChain`` top-left is now a link to ``/`` -- clicking it
+  refreshes the page (also drops any community filter or
+  ``#tx-...`` permalink in the URL).
+* New header pill ``h<height> · <since-last-block>`` tracks chain
+  liveness at a glance.  Coloring follows the same GREEN / YELLOW
+  (>30 min) / RED (>60 min) bands the ``messagechain status`` CLI
+  uses so the page header doesn't disagree with the operator-facing
+  health check.
+* Feed default time window flipped to "all time" (was past 24h).
+  The bootstrap chain has sparse traffic and a 24h default
+  rendered empty on most page loads.  Once traffic picks up the
+  default should switch back so the page loads quickly.
+* Dropped the redundant ``(no wallet loaded)`` / ``read-only``
+  header chips -- the right-side Sign in / Create account buttons
+  already telegraph signed-out state.
+* Create Account warning copy rewritten to drop the "demo" framing
+  (the wallet IS the user's wallet; only meaningful warning is the
+  server-memory key-custody risk).  Recommends two off-ramps:
+  generate offline via ``messagechain generate-key`` (with a link
+  to the public repo), OR create here and later rotate to an
+  offline-generated key -- identity, history, balance, and
+  reputation all carry over via the existing in-protocol
+  key-rotation primitive.
+* New ``github`` link next to the MessageChain logo, opening the
+  public repo in a new tab.
+* Create Account warning modal dropped its Cancel button AND the
+  top-right close X.  Click-outside-the-modal cancels.  Generalized
+  via a new ``confirmAction({ hideCancel })`` option, with an
+  ``onNextModalClose()`` helper that resolves the underlying Promise
+  as "cancelled" for ANY close path (X / backdrop / Escape).
+* Tightened nav-bar -> main-content gap (nav margin, tab padding,
+  main top padding).
+* Post-mint success modal: title ``"Your demo wallet is ready"`` ->
+  ``"Your wallet is ready"``, no close button, dropped the inline
+  ``"Start using MessageChain"`` CTA.  Side effects that used to
+  hang off the CTA (refresh + drip watcher) now fire immediately
+  on render so the funded-balance + balance-pill update arrive
+  without the user clicking anywhere.  Generated ``.key`` blob's
+  comment header also de-demoed.
+* Feed always renders a composer-shaped surface.  When read-only,
+  the composer is swapped for a sign-in nudge so the Feed never
+  looks empty under the toolbar.
+* Activity tab: pending faucet drip now lands in Pending
+  immediately after Create Account succeeds (``pushTxHistory`` was
+  previously gated on ``YOU`` being populated; refresh order fixed
+  + ``YOU`` is eagerly seeded from the create-account response).
+  Renamed ``All transactions`` -> ``Finalized`` and split rendering
+  so a row appears in exactly one of {Pending, Finalized}, not both.
+  New ``TX_KIND_LABEL.faucet`` = ``"faucet drip"``.
+  ``watchDripUntilConfirmed`` also calls ``updateTxHistoryStatus`` so
+  the row flips Pending -> Finalized within seconds of block inclusion
+  (instead of waiting on the periodic ``pollPendingTxStatuses`` tick).
+
 ## [1.88.1] — 2026-05-18
 
 Hotfix to the 1.88.0 Create Account flow: wallet UI now honors
