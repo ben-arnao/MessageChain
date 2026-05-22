@@ -3019,7 +3019,12 @@ function openSigninModal() {
 
   // Or upload a keyfile.  Reads the file as text, dumps into the
   // textarea (so the user sees what's about to be sent and the
-  // backend's existing decode_private_key parses it).
+  // backend's existing decode_private_key parses it).  Also parses
+  // "# Tree height: N" from the .key file's comment header and
+  // stashes it on the textarea via dataset so the sign-in POST can
+  // pass it as a hint -- without that, a Create Account keyfile
+  // (h=10) signing in on a cold server falls back to a multi-minute
+  // h=20 keygen AND ends up at the wrong entity_id.
   const fileLabel = document.createElement("label");
   fileLabel.className = "hint";
   fileLabel.style.display = "block";
@@ -3034,6 +3039,14 @@ function openSigninModal() {
     try {
       const txt = await f.text();
       ta.value = txt.trim();
+      // Parse "# Tree height: N" if present.  Best-effort: a missing
+      // header just means "no hint, server will probe" -- the same
+      // safe fallback the paste-hex flow uses.
+      const m = txt.match(/^#\s*Tree height:\s*(\d+)/im);
+      if (m) {
+        const h = parseInt(m[1], 10);
+        if (h >= 2 && h <= 24) ta.dataset.treeHeight = String(h);
+      }
     } catch (_) {
       toast("Failed to read keyfile", "err");
     }
@@ -3079,12 +3092,24 @@ function openSigninModal() {
     if (!value) { toast("Paste your key first", "err"); return; }
     const duration = durationSelect
       ? parseInt(durationSelect.value, 10) : 86400;
+    // Optional tree-height hint parsed from an uploaded .key file's
+    // "# Tree height: N" comment header.  Stashed on the textarea
+    // via dataset by the file picker; absent for the paste-hex flow
+    // (server falls back to its candidate-height probe, which now
+    // covers h=10 as well).
+    const hintRaw = ta.dataset.treeHeight;
+    const treeHeight = hintRaw ? parseInt(hintRaw, 10) : null;
     ok.disabled = true;
-    ok.textContent = "Signing in (may take minutes on first load)…";
+    // Honest sign-in label: a hinted h=10 keyfile is sub-second; a
+    // cache-hit at any height is milliseconds; only a full
+    // production-height keygen takes minutes, and the Create Account
+    // flow on this deployment never produces such wallets.
+    ok.textContent = "Signing in…";
     try {
-      const r = await apiPost("/wallet/login", {
-        value: value, duration_sec: duration,
-      });
+      const r = await apiPost("/wallet/login", Object.assign(
+        { value: value, duration_sec: duration },
+        treeHeight ? { tree_height: treeHeight } : {},
+      ));
       if (r.status !== 200 || !r.data || !r.data.ok) {
         toast(
           "Sign in failed: " +

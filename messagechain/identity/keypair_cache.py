@@ -251,8 +251,17 @@ def load_or_create_personal_wallet_entity(
     from messagechain.config import (
         WALLET_DEFAULT_TREE_HEIGHT, MERKLE_TREE_HEIGHT,
     )
+    # Probe the demo-account height (10) first since cache HIT there is
+    # the fast common path for the messagechain.org Create Account flow
+    # -- without h=10 in the candidate list, a /wallet/login that pastes
+    # a Create Account .key would miss the cache at h=16 + h=20, then
+    # fall back to a multi-minute Entity.create at the production height
+    # AND produce the wrong entity_id (different root per height).
+    # File-existence + HMAC verify on hit is cheap, so adding extra
+    # probe candidates is essentially free on the cache-hit fast path.
+    DEMO_ACCOUNT_HEIGHT = 10
     candidate_heights = []
-    for h in (WALLET_DEFAULT_TREE_HEIGHT, MERKLE_TREE_HEIGHT):
+    for h in (DEMO_ACCOUNT_HEIGHT, WALLET_DEFAULT_TREE_HEIGHT, MERKLE_TREE_HEIGHT):
         if h not in candidate_heights:
             candidate_heights.append(h)
     for h in candidate_heights:

@@ -640,6 +640,25 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             duration_sec = _DEFAULT_SESSION_SECONDS
 
+        # Optional tree_height hint.  The SPA reads "# Tree height: N"
+        # from an uploaded .key file's comment header and passes it
+        # here, so the server skips the candidate-height probe
+        # (h=16 + h=20 by default) and goes straight to the user's
+        # actual tree height.  Without this hint, a Create Account
+        # wallet (h=10) signing in via a fresh server would fall back
+        # to a multi-minute Entity.create at h=20 AND produce the
+        # wrong entity_id.  Range-checked to refuse absurd values
+        # that would either be free spam-keygen or instant OOM.
+        tree_height_hint = None
+        raw_hint = body.get("tree_height")
+        if raw_hint is not None:
+            try:
+                cand = int(raw_hint)
+                if 2 <= cand <= 24:
+                    tree_height_hint = cand
+            except (TypeError, ValueError):
+                pass
+
         # Parse the input.  decode_private_key accepts mnemonic +
         # 72-char checksummed hex; we add explicit support for the
         # 64-char raw hex form too (operator-paste convenience).
@@ -690,7 +709,9 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         # signing seed, NOT the original PK) is stored in memory.
         try:
             from messagechain.cli import _resolve_signing_entity
-            entity = _resolve_signing_entity(private_key, args=None)
+            entity = _resolve_signing_entity(
+                private_key, args=None, tree_height=tree_height_hint,
+            )
         except Exception as e:
             logger.warning(
                 "wallet login keygen failed: %s", type(e).__name__,
@@ -766,15 +787,27 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         # 1. Generate a fresh PK (cryptographically random).  No
         #    persistence on the server side; the user gets a copy
         #    via the response and is responsible for saving it.
-        from messagechain.identity.identity import Entity
         from messagechain.identity.address import encode_address
         from messagechain.identity.key_encoding import encode_to_mnemonic
+        from messagechain.identity.keypair_cache import (
+            load_or_create_personal_wallet_entity,
+        )
 
         new_pk = secrets.token_bytes(32)
 
-        # 2. Build the demo-tree Entity.  Sub-second at h=12.
+        # 2. Build the demo-tree Entity AND write the personal-wallet
+        #    keypair cache at h=10.  Without the cache write, a later
+        #    /wallet/login with this same PK would miss the cache at
+        #    every probed height and fall back to Entity.create at
+        #    the production WALLET_DEFAULT_TREE_HEIGHT -- a multi-
+        #    minute keygen that ALSO produces the wrong entity_id
+        #    (the tree root differs by height, so the user would end
+        #    up signed into an empty wallet, not their funded one).
+        #    Routing through load_or_create_personal_wallet_entity
+        #    here makes the keygen + cache-write atomic, and the
+        #    next sign-in is a sub-millisecond cache hit.
         try:
-            new_entity = Entity.create(
+            new_entity = load_or_create_personal_wallet_entity(
                 new_pk, tree_height=DEMO_ACCOUNT_TREE_HEIGHT,
             )
         except Exception as e:
