@@ -109,6 +109,25 @@
     font-weight: 600;
     font-size: 1.05rem;
     margin-right: 0.4rem;
+    color: var(--fg);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .you-row .brand:hover { color: var(--accent); }
+  .you-row .brand-sep {
+    color: var(--muted);
+    margin: 0 0.05rem 0 -0.2rem;
+  }
+  .you-row .gh-link {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 0.9rem;
+    margin-right: 0.4rem;
+  }
+  .you-row .gh-link:hover { color: var(--accent); text-decoration: underline; }
+  .chain-meta {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
   }
   .pill {
     display: inline-block;
@@ -142,7 +161,7 @@
   nav.tabs {
     display: flex;
     gap: 0.2rem;
-    margin-top: 0.7rem;
+    margin-top: 0.45rem;
     border-bottom: 1px solid var(--border);
     margin-bottom: -1px;
     overflow-x: auto;
@@ -152,7 +171,7 @@
     border: none;
     border-bottom: 2px solid transparent;
     border-radius: 0;
-    padding: 0.55rem 1rem;
+    padding: 0.45rem 1rem;
     color: var(--muted);
     flex-shrink: 0;
   }
@@ -163,7 +182,7 @@
   main {
     max-width: 720px;
     margin: 0 auto;
-    padding: 1rem;
+    padding: 0.6rem 1rem 1rem;
   }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
@@ -682,13 +701,15 @@
 
 <header class="app-header">
   <div class="you-row">
-    <span class="brand">MessageChain</span>
-    <span id="you-mode" class="pill">loading…</span>
+    <a class="brand" id="brand-link" href="/" title="Refresh">MessageChain</a>
+    <span class="brand-sep">·</span>
+    <a class="gh-link" id="gh-link" href="https://github.com/ben-arnao/MessageChain" target="_blank" rel="noopener" title="MessageChain on GitHub">github</a>
+    <span id="chain-meta" class="pill chain-meta" title="chain height · time since last block"></span>
     <span id="you-id" class="you-id" title="Click to copy your address"></span>
     <span class="grow"></span>
     <span id="you-balance" class="pill" title="your token balance on chain"></span>
     <span id="you-sigs" class="pill" title="WOTS+ one-time signatures left on your current key tree (rotate-key to refresh)"></span>
-    <button id="auth-create" style="display:none;" title="Generate a fresh demo wallet (public deployments only)">Create account</button>
+    <button id="auth-create" style="display:none;" title="Create an account on this server">Create account</button>
     <button id="auth-signin" style="display:none;" class="primary">Sign in</button>
     <button id="auth-signout" style="display:none;">Sign out</button>
   </div>
@@ -704,6 +725,16 @@
 
 <!-- ============================================================== Feed -->
 <section class="tab-panel active" id="tab-feed">
+  <!-- Read-only placeholder shown when no entity is loaded.  Per
+       item #10, the post composer area is ALWAYS present so the
+       Feed never feels empty when there are no messages -- when the
+       user isn't signed in we surface a sign-in CTA in its place. -->
+  <div class="composer" id="composer-readonly" style="display:none;">
+    <div class="hint" style="margin: 0.2rem 0 0.6rem;">
+      <strong>Want to post?</strong>  Sign in or create an account
+      from the top right.
+    </div>
+  </div>
   <div class="composer" id="composer">
     <textarea id="composer-text" placeholder="What's on your mind?  (Cmd/Ctrl+Enter to post)"></textarea>
     <div class="row">
@@ -729,9 +760,9 @@
     <label>Time
       <select id="feed-time">
         <option value="3600">past hour</option>
-        <option value="86400" selected>past 24 hours</option>
+        <option value="86400">past 24 hours</option>
         <option value="604800">past week</option>
-        <option value="0">all time</option>
+        <option value="0" selected>all time</option>
       </select>
     </label>
     <label>Sort
@@ -803,8 +834,8 @@
     <div id="activity-pending" class="hint">No pending transactions.</div>
   </div>
   <div class="panel">
-    <h2>All transactions</h2>
-    <div id="activity-history" class="hint">No transactions yet.</div>
+    <h2>Finalized</h2>
+    <div id="activity-history" class="hint">No finalized transactions yet.</div>
   </div>
 </section>
 
@@ -861,7 +892,7 @@
 <div class="minter-backdrop" id="minter-backdrop">
   <div class="minter-card">
     <div class="minter-spinner" aria-hidden="true"></div>
-    <div class="minter-title">Creating your demo wallet</div>
+    <div class="minter-title">Creating your wallet</div>
     <div class="minter-stage" id="minter-stage">Generating your key…</div>
     <div class="minter-hint">This takes a couple of seconds — keep this tab open.</div>
   </div>
@@ -927,6 +958,20 @@ function relTime(sec) {
   if (diff < 3600) return Math.floor(diff / 60) + "m ago";
   if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
   return Math.floor(diff / 86400) + "d ago";
+}
+// Header chain-meta pill helper.  Mirrors the `messagechain status`
+// CLI's GREEN/YELLOW/RED liveness heuristic: block-time on the bootstrap
+// chain is ~10 min, so up to ~3 cadence intervals (~30 min) is healthy,
+// ~6 intervals (~60 min) is a warning, beyond that the chain is stalled.
+function formatChainAge(lastBlockTs) {
+  if (typeof lastBlockTs !== "number") {
+    return { label: "—", long: "(unknown)", severity: "" };
+  }
+  const diffSec = Math.max(0, Math.floor((Date.now() / 1000) - lastBlockTs));
+  let severity = "";
+  if (diffSec > 3600) severity = "error";
+  else if (diffSec > 1800) severity = "warn";
+  return { label: relTime(lastBlockTs), long: formatTs(lastBlockTs) + " (" + relTime(lastBlockTs) + ")", severity };
 }
 let _toastTimer = null;
 function toast(msg, kind) {
@@ -1202,6 +1247,7 @@ const TX_KIND_LABEL = {
   unstake: "unstake",
   propose: "proposal",
   "vote-proposal": "gov vote",
+  faucet: "faucet drip",
 };
 
 function renderActivityIfVisible() {
@@ -1215,8 +1261,11 @@ function renderActivity() {
   const histEl = $("activity-history");
   if (!pendingEl || !histEl) return;
   const rows = getMyTxHistory();
+  // Split into Pending + Finalized rather than Pending + All-of-the-above
+  // -- a pending row showing up in BOTH lists is confusing (and the
+  // user's iter 7p feedback explicitly asked for two distinct groups).
   const pending = rows.filter(r => r.status === "pending");
-  const all = rows;
+  const finalized = rows.filter(r => r.status !== "pending");
 
   function buildRow(r) {
     const row = document.createElement("div");
@@ -1278,12 +1327,12 @@ function renderActivity() {
   }
 
   histEl.innerHTML = "";
-  if (all.length === 0) {
+  if (finalized.length === 0) {
     histEl.className = "hint";
-    histEl.textContent = "No transactions yet.";
+    histEl.textContent = "No finalized transactions yet.";
   } else {
     histEl.className = "";
-    all.forEach(r => histEl.appendChild(buildRow(r)));
+    finalized.forEach(r => histEl.appendChild(buildRow(r)));
   }
 }
 
@@ -1356,12 +1405,9 @@ function switchTab(name) {
 
 // =========================================================== "you" header
 async function refreshMe() {
-  const youMode = $("you-mode");
   try {
     const r = await api("/wallet/me");
     if (r.status !== 200) {
-      youMode.textContent = "error " + r.status;
-      youMode.className = "pill error";
       YOU = null;
       return null;
     }
@@ -1374,17 +1420,20 @@ async function refreshMe() {
     document.body.classList.toggle("readonly", m.mode === "read-only");
     updateAuthButtons(m);
     if (m.mode === "read-only") {
-      youMode.textContent = "read-only";
-      youMode.className = "pill warn";
-      $("you-id").textContent = "(no wallet loaded)";
+      // No "(no wallet loaded)" / "read-only" chips here -- the
+      // right-side Sign in / Create account buttons already telegraph
+      // the signed-out state.  Pills that go empty disappear via the
+      // `.pill:empty { display: none }` CSS rule above.
+      $("you-id").textContent = "";
       $("you-id").onclick = null;
       $("you-id").oncontextmenu = null;
       $("you-balance").textContent = "";
       $("you-sigs").textContent = "";
-      $("composer").style.display = "none";
+      // Composer is still hidden in read-only mode (no key to sign
+      // posts with) but Feed item #10 wants Feed to ALWAYS render the
+      // composer area -- the placeholder is a sign-in nudge.
+      renderComposerForReadonly();
     } else {
-      youMode.textContent = "wallet";
-      youMode.className = "pill ok";
       const idEl = $("you-id");
       idEl.textContent = shortAddr(m.address || ("mc1?" + m.entity_id));
       idEl.title = "open your profile (right-click to copy address)";
@@ -1399,25 +1448,59 @@ async function refreshMe() {
         s.textContent = m.sigs_remaining + " sigs";
         s.className = "pill" + (m.sigs_remaining < 100 ? " warn" : "");
       }
+      renderComposerForSignedIn();
     }
     return m;
   } catch (_) {
-    youMode.textContent = "unreachable";
-    youMode.className = "pill error";
     return null;
   }
 }
 
+// Composer visibility helpers.  Per item #10 the Feed ALWAYS renders
+// a composer-shaped surface -- when no key is loaded we swap the
+// signed-in composer for a sign-in nudge so the Feed never looks empty.
+function renderComposerForReadonly() {
+  const c = document.getElementById("composer");
+  const ro = document.getElementById("composer-readonly");
+  if (c) c.style.display = "none";
+  if (ro) ro.style.display = "block";
+}
+function renderComposerForSignedIn() {
+  const c = document.getElementById("composer");
+  const ro = document.getElementById("composer-readonly");
+  if (c) c.style.display = "";
+  if (ro) ro.style.display = "none";
+}
+
 async function refreshChainStatus() {
-  // Side-effects only: probes /v1/info so the WALLET_MODE +
-  // CREATE_ACCOUNT_ENABLED globals stay current.  The chain-height
-  // pill is no longer surfaced in the user-facing header -- low-level
-  // network state belongs to the CLI / operator tooling.
+  // Probes /v1/info on every poll tick.  Two side-effects:
+  //   1. WALLET_MODE + CREATE_ACCOUNT_ENABLED globals stay current
+  //      (drives the auth-button visibility + sign-in modal copy).
+  //   2. The header chain-meta pill renders "h2840 · 4d ago" so a
+  //      visitor can tell at a glance whether the chain is producing.
   try {
     const r = await api("/v1/info");
-    if (r.status !== 200) return null;
-    if (r.data.wallet_mode === "public" || r.data.wallet_mode === "local") {
-      WALLET_MODE = r.data.wallet_mode;
+    if (r.status !== 200) {
+      const el = document.getElementById("chain-meta");
+      if (el) { el.textContent = "chain unreachable"; el.className = "pill chain-meta error"; }
+      return null;
+    }
+    const d = r.data;
+    // Header chain-meta: height + a human-readable "since last
+    // block" interval.  Coloring follows liveness -- green when a
+    // block landed within ~3 cadence intervals (~30 min), yellow up
+    // to ~6 (~60 min), red beyond.  Matches the `status` CLI's
+    // GREEN/YELLOW/RED heuristic so the UI doesn't disagree with the
+    // operator-facing health check.
+    const meta = document.getElementById("chain-meta");
+    if (meta && typeof d.height === "number") {
+      const since = formatChainAge(d.last_block_timestamp);
+      meta.textContent = "h" + d.height + " · " + since.label;
+      meta.className = "pill chain-meta" + (since.severity ? " " + since.severity : "");
+      meta.title = "chain height " + d.height + " · last block " + since.long;
+    }
+    if (d.wallet_mode === "public" || d.wallet_mode === "local") {
+      WALLET_MODE = d.wallet_mode;
     }
     CREATE_ACCOUNT_ENABLED = !!r.data.create_account_enabled;
     return r.data;
@@ -1655,10 +1738,13 @@ let CURRENT_MESSAGES = [];
 // reloads / shared links keep the filter.
 let CURRENT_COMMUNITY = null;
 // Toolbar-driven view controls (Reddit/Twitter-style).  Defaults:
-// past 24h, sort by upvotes, all communities.  Persisted in
-// localStorage so they survive page reloads.
+// all time (the chain is still in bootstrap and traffic is sparse;
+// a "past 24h" default would show empty on most page loads -- once
+// traffic picks up this should switch to 24h so the page loads quickly).
+// Sort by upvotes, all communities.  Persisted in localStorage so they
+// survive page reloads.
 const FEED_PREFS_KEY = "mc.wallet.feed-prefs";
-let FEED_TIME_WINDOW_SEC = 86400;
+let FEED_TIME_WINDOW_SEC = 0;
 let FEED_SORT = "upvotes";
 function loadFeedPrefs() {
   try {
@@ -2785,8 +2871,30 @@ async function reactUser(entityId, choice) {
   }
 }
 
-function showModal() { $("modal-backdrop").classList.add("open"); }
-function closeModal() { $("modal-backdrop").classList.remove("open"); }
+// One-shot close callbacks.  Lets a caller wire side-effects to
+// "modal got dismissed for ANY reason" (X button, backdrop click,
+// Escape) without subclassing closeModal.  Cleared on the next
+// closeModal() call regardless of whether it actually fires (so a
+// caller that opens-closes-opens doesn't leak old callbacks).
+let _MODAL_CLOSE_CALLBACKS = [];
+function onNextModalClose(cb) { _MODAL_CLOSE_CALLBACKS.push(cb); }
+
+function showModal(opts) {
+  const bd = $("modal-backdrop");
+  bd.classList.add("open");
+  // `opts.hideClose` hides the top-right X for "click-outside is the
+  // only way out" flows (Create Account warning, post-mint success).
+  // Otherwise the X stays visible -- some modals want an explicit
+  // close affordance (sign-in, profile, etc.).
+  const closeRow = bd.querySelector(".close-row");
+  if (closeRow) closeRow.style.display = (opts && opts.hideClose) ? "none" : "";
+}
+function closeModal() {
+  $("modal-backdrop").classList.remove("open");
+  const cbs = _MODAL_CLOSE_CALLBACKS;
+  _MODAL_CLOSE_CALLBACKS = [];
+  cbs.forEach(fn => { try { fn(); } catch (_) {} });
+}
 $("modal-close").addEventListener("click", closeModal);
 $("modal-backdrop").addEventListener("click", e => {
   if (e.target === $("modal-backdrop")) closeModal();
@@ -2817,24 +2925,46 @@ function confirmAction(opts) {
     $("modal-title").textContent = opts.title || "Confirm";
     const body = $("modal-body");
     body.innerHTML = "";
+    // `opts.bodyHtml` lets callers inject rich markup (links, code
+    // blocks); falls back to the plain-text `opts.body` for the
+    // common "just confirm this" cases.  textContent is preserved
+    // (vs innerHTML) on the plain-text path so an attacker who
+    // controls the body string can't inject HTML.
     const p = document.createElement("p");
-    p.style.whiteSpace = "pre-wrap";
-    p.textContent = opts.body || "";
+    if (opts.bodyHtml) {
+      p.innerHTML = opts.bodyHtml;
+    } else {
+      p.style.whiteSpace = "pre-wrap";
+      p.textContent = opts.body || "";
+    }
     body.appendChild(p);
     const actions = document.createElement("div");
     actions.className = "actions";
-    const cancel = document.createElement("button");
-    cancel.textContent = opts.cancelLabel || "Cancel";
+    let cancel = null;
+    if (!opts.hideCancel) {
+      cancel = document.createElement("button");
+      cancel.textContent = opts.cancelLabel || "Cancel";
+    }
     const ok = document.createElement("button");
     ok.textContent = opts.okLabel || "OK";
     if (opts.okClass) ok.className = opts.okClass;
-    actions.appendChild(cancel);
+    if (cancel) actions.appendChild(cancel);
     actions.appendChild(ok);
     body.appendChild(actions);
-    function done(v) { closeModal(); resolve(v); }
-    cancel.addEventListener("click", () => done(false));
+    // Track whether the OK button was clicked so that ANY other
+    // close path (X button, backdrop click, Escape) resolves the
+    // promise as "cancelled" instead of leaving the caller hanging.
+    let resolved = false;
+    function done(v) {
+      if (resolved) return;
+      resolved = true;
+      closeModal();
+      resolve(v);
+    }
+    if (cancel) cancel.addEventListener("click", () => done(false));
     ok.addEventListener("click", () => done(true));
-    showModal();
+    onNextModalClose(() => done(false));
+    showModal({ hideClose: !!opts.hideCancel });
     setTimeout(() => ok.focus(), 0);
   });
 }
@@ -3087,6 +3217,11 @@ async function watchDripUntilConfirmed(txHash) {
       if (r.status === 200 && r.data && r.data.ok) {
         const result = r.data.result || {};
         if (result.status === "included") {
+          // Flip the Activity row from "pending" -> "confirmed" so
+          // the user sees the drip move out of the Pending bucket
+          // into Finalized without waiting for the next periodic
+          // pollPendingTxStatuses tick.
+          updateTxHistoryStatus(txHash, "confirmed");
           await refreshMe();
           toast("✓ Faucet funds arrived — your wallet is ready to use.", "ok");
           return;
@@ -3103,19 +3238,32 @@ async function openCreateAccountModal() {
   // load-bearing -- "create account on the web" is a deliberately
   // discouraged path per the user-facing copy.
   const proceed = await confirmAction({
-    title: "Create demo account",
-    body:
-      "Creating an account in the browser is FOR DEMO PURPOSES ONLY.\n\n" +
-      "Your private key is generated on the server, briefly held in " +
-      "server memory, then handed back to you as a download.  A " +
-      "server compromise during that window leaks the key.  The demo " +
-      "wallet is also small (4096 one-time signatures) -- enough to " +
-      "try the chain, not enough for a long-lived account.\n\n" +
-      "For real wallets, install MessageChain locally and run " +
-      "`messagechain generate-key` offline (see the README).\n\n" +
-      "Continue with a demo account?",
-    okLabel: "Yes, mint a demo account",
+    title: "Create account",
+    okLabel: "Create account",
     okClass: "primary",
+    hideCancel: true,
+    // Plain HTML so we can link to the GitHub project AND keep the
+    // recommendation list compact.  The copy avoids "demo" framing
+    // per ben's iter 7p feedback -- the wallet IS your wallet; the
+    // only meaningful warning is the server-memory key-custody risk
+    // and the path off this UI (offline keygen OR identity transfer).
+    bodyHtml:
+      "<p>For best security we recommend creating your account offline. " +
+      "On a server-hosted account, your private key briefly lives in " +
+      "the server's memory before it's handed back to you — a server " +
+      "compromise during that window would leak the key.</p>" +
+      "<p>You have two safer paths:</p>" +
+      "<ul style='margin: 0.4rem 0 0.6rem 1.2rem; padding: 0;'>" +
+      "<li>Install MessageChain locally and run " +
+      "<code>messagechain generate-key</code> offline " +
+      "(<a href='https://github.com/ben-arnao/MessageChain' " +
+      "target='_blank' rel='noopener'>github.com/ben-arnao/MessageChain</a>)." +
+      "</li>" +
+      "<li>Or create an account here now, then later rotate the " +
+      "key to a fresh offline-generated one — your identity, " +
+      "history, balance, and reputation all carry over.</li>" +
+      "</ul>" +
+      "<p style='margin-bottom: 0;'>Click off this window to cancel.</p>",
   });
   if (!proceed) return;
 
@@ -3145,15 +3293,15 @@ async function openCreateAccountModal() {
   // copy of the PK the user will ever get -- if they close the
   // page before the download completes the wallet is lost.
   const blob =
-    "# MessageChain demo wallet -- generated " +
+    "# MessageChain wallet -- generated " +
     new Date().toISOString() + "\n" +
     "# Address: " + d.address + "\n" +
     "# Entity:  " + d.entity_id + "\n" +
     "# Tree height: " + d.tree_height + " (" + d.sigs_total + " one-time signatures)\n" +
     "#\n" +
     "# Treat this file as a password.  Anyone who has it controls\n" +
-    "# the wallet.  Demo wallets have limited signing capacity --\n" +
-    "# for real use, run `messagechain generate-key` offline.\n" +
+    "# the wallet.  For long-term use, rotate to a key generated\n" +
+    "# offline via `messagechain generate-key`.\n" +
     "#\n" +
     "# Mnemonic (24 words):\n" +
     "# " + (d.mnemonic || "(unavailable)") + "\n" +
@@ -3165,14 +3313,38 @@ async function openCreateAccountModal() {
   // Stash the new session token so subsequent /wallet/* requests work.
   if (d.session_id) sessionStorage.setItem(TOKEN_KEY, d.session_id);
 
-  // Post-mint summary: keep it minimal -- the user clicked Create
-  // Account, they want to start using the app, not stare at five
-  // click-to-copy fields including the raw private key.  The full key
-  // material (mnemonic + raw hex + entity_id) is in the .key file
-  // they just downloaded; the modal surfaces (a) backup reminder and
-  // (b) their address.  Power users who want to copy the mnemonic
-  // separately can expand the collapsible.
-  $("modal-title").textContent = "Your demo wallet is ready";
+  // Seed YOU.entity_id eagerly so the pushTxHistory call below
+  // associates the drip with the freshly-minted wallet.  Without
+  // this seed, pushTxHistory early-returns (it scopes rows by
+  // YOU.entity_id) and the drip never lands in Activity > Pending.
+  // The full /wallet/me refresh further down replaces YOU with the
+  // complete record once the session token is honored.
+  if (!YOU || YOU.entity_id !== d.entity_id) {
+    YOU = { entity_id: d.entity_id, address: d.address, mode: "wallet" };
+  }
+
+  // Record the faucet drip in Activity > Pending so the user sees
+  // their incoming funds tracked immediately (item #11).  The
+  // watchDripUntilConfirmed poller below flips the status to
+  // "confirmed" once the drip is included in a block.
+  if (d.drip_tx_hash) {
+    pushTxHistory({
+      tx_hash: d.drip_tx_hash,
+      kind: "faucet",
+      fee: 0,
+      label: "incoming faucet drip",
+      status: "pending",
+    });
+  }
+
+  // Post-mint summary: minimal -- the user clicked Create Account
+  // because they want to start posting, not stare at five click-to-
+  // copy fields including the raw private key.  The full key material
+  // (mnemonic + raw hex + entity_id) is in the .key file they just
+  // downloaded; the modal surfaces (a) backup reminder and (b) their
+  // address.  Power users who want to copy the mnemonic separately
+  // can expand the collapsible.
+  $("modal-title").textContent = "Your wallet is ready";
   const body = $("modal-body");
   body.innerHTML = "";
   const ok = document.createElement("div");
@@ -3228,29 +3400,22 @@ async function openCreateAccountModal() {
   note.className = "hint";
   note.style.marginTop = "0.7rem";
   note.textContent =
-    "You're signed in.  Faucet funds usually arrive within a few seconds.";
+    "You're signed in.  Faucet funds usually arrive within a few " +
+    "seconds.  Click off this window to start posting.";
   body.appendChild(note);
 
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  const close = document.createElement("button");
-  close.className = "primary";
-  close.textContent = "Start using MessageChain";
-  close.addEventListener("click", () => {
-    closeModal();
-    refreshMe().then(refreshFeed);
-    // Watch the faucet drip so the balance pill flips from "0 bal" to
-    // the funded amount within ~5s of block inclusion -- without this
-    // the user waits up to the periodic refreshMe cadence (25s).
-    if (d.drip_tx_hash) watchDripUntilConfirmed(d.drip_tx_hash);
-  });
-  actions.appendChild(close);
-  body.appendChild(actions);
+  // No CTA button per item #9 -- click-outside dismisses.  Side
+  // effects that USED to hang off the CTA (balance refresh + drip
+  // watcher) now fire immediately on render so they're not gated on
+  // the user clicking anywhere.
+  refreshMe().then(refreshFeed);
+  if (d.drip_tx_hash) watchDripUntilConfirmed(d.drip_tx_hash);
+
   // Hide the minter loader exactly when the success modal renders, so
   // the transition looks like spinner -> success card (no flicker, no
   // brief "naked feed" frame).
   hideMinterLoader();
-  showModal();
+  showModal({ hideClose: true });
 }
 
 // ============================================================ Wallet tab
@@ -3446,18 +3611,12 @@ async function refreshIdentity() {
   const t = bootstrapToken();
   if (!t && WALLET_MODE !== "public") {
     // LOCAL-mode wallet with no session token in the URL: there is
-    // nothing the UI can do.  Drop the composer + write-only forms,
-    // surface a clear "no session" pill instead of leaving the page in
-    // its half-loaded default state, and toast the operator-facing
-    // restart hint.
+    // nothing the UI can do.  Drop the composer + write-only forms
+    // and toast the operator-facing restart hint.  The header no
+    // longer carries a "no session" pill (the right-side auth
+    // buttons telegraph signed-out state already).
     document.body.classList.add("readonly");
-    const youMode = $("you-mode");
-    if (youMode) {
-      youMode.textContent = "no session";
-      youMode.className = "pill error";
-    }
-    const composer = $("composer");
-    if (composer) composer.style.display = "none";
+    renderComposerForReadonly();
     toast("No session token in URL.  Restart with `messagechain ui`.", "err");
     return;
   }
