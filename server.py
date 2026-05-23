@@ -1270,10 +1270,58 @@ class Server(SharedRuntimeMixin):
             else:
                 self.rpc_auth_token = _rng.urandom(32).hex()
                 self._rpc_auth_token_source = "generated"
+            # Persist the active token to <data_dir>/rpc_auth_token (0600)
+            # so a same-host operator CLI can call admin RPCs (ban_peer,
+            # unban_peer, get_banned_peers, reserve_leaf, ...) without
+            # having to fish the token out of the daemon's process
+            # memory.  Pre-1.88.3 this required either pre-setting
+            # MESSAGECHAIN_RPC_AUTH_TOKEN in the systemd unit (most
+            # operators don't) or hand-editing ban_scores.json -- the
+            # exact friction that turned a 5-minute unban into a
+            # multi-step incident on 2026-05-22.  Best-effort: a write
+            # failure (read-only fs, permission error) logs at WARNING
+            # and continues; the CLI's MESSAGECHAIN_RPC_AUTH_TOKEN env
+            # var path still works as a fallback.
+            if self.data_dir is not None:
+                self._write_rpc_auth_token_file()
             self._log_rpc_auth_status()
 
         # inv/getdata: track recently seen tx hashes
         self._seen_txs: OrderedDict = OrderedDict()
+
+    def _write_rpc_auth_token_file(self) -> None:
+        """Persist the active RPC auth token to <data_dir>/rpc_auth_token
+        with mode 0600 so a same-host operator CLI can pick it up
+        automatically without operator env-var setup.  Write is atomic
+        (tmp + fsync + rename) so a concurrent CLI read can never see
+        a partial token.  Best-effort: a write failure does NOT crash
+        the daemon -- the CLI still has the env-var fallback path.
+
+        The on-disk file's user/group ownership matches the daemon's
+        own (operator usually runs the daemon as user `messagechain`),
+        so a CLI running as the same user reads it cleanly while a
+        different user gets EACCES.  No additional ACL needed.
+        """
+        path = os.path.join(self.data_dir, "rpc_auth_token")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(self.rpc_auth_token + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning(
+                "Could not persist RPC auth token to %s (%s); "
+                "operator CLI admin commands will require setting "
+                "MESSAGECHAIN_RPC_AUTH_TOKEN env var to match the "
+                "daemon's token.",
+                path, e,
+            )
 
     def _log_rpc_auth_status(self):
         # Never log any portion of the token. Operators retrieve it via

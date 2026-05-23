@@ -1000,6 +1000,43 @@ def build_parser() -> argparse.ArgumentParser:
              "queries YOUR local node's peer table)",
     )
 
+    # --- unban-peer ---
+    # Operator escape hatch for the stale-ban scenario surfaced on
+    # 2026-05-22: an honest peer earns a 24h instant-ban for a state-
+    # root mismatch that's actually caused by the LOCAL daemon's
+    # drifted in-memory state.  After the local daemon restarts and
+    # recomputes state, the ban is no longer warranted, but auto-clear
+    # can't fire (audit r45 #1 strict-newer-semver gate is intentional
+    # and not getting relaxed -- relaxing it re-opens the ban-bypass
+    # attack surface for malicious peers).  Pre-1.88.3 the only fix
+    # was hand-editing ban_scores.json + restart.  This CLI wraps the
+    # existing `unban_peer` admin RPC so the operator's recovery is a
+    # one-liner.
+    unban_peer = sub.add_parser(
+        "unban-peer",
+        help="Clear a peer ban (operator override)",
+        description=(
+            "Manually clear a stale peer ban from the local node's "
+            "ban table.  Use when an honest peer was banned due to a "
+            "local-state bug whose fix has shipped -- the peer's "
+            "peer_version field on the ban record blocks auto-clear "
+            "from firing when the bug is fixed via process restart "
+            "rather than a version bump.\n\n"
+            "Authentication: needs the RPC admin token (1.88.3+: "
+            "auto-read from <data_dir>/rpc_auth_token when same-host; "
+            "remote callers set MESSAGECHAIN_RPC_AUTH_TOKEN env var)."
+        ),
+    )
+    unban_peer.add_argument(
+        "address", type=str,
+        help="Peer to unban, format host:port (e.g. 35.237.211.12:9333)",
+    )
+    unban_peer.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334 -- "
+             "operates on YOUR local node's ban table)",
+    )
+
     # --- receipt ---
     # The receipt command is the user-visible surface that names the
     # protocol's defining property: slashing-backed permanence.  Without
@@ -6473,6 +6510,43 @@ def cmd_validators(args):
         print(f"  {eid:<20} {v['staked']:>14} {v['stake_pct']:>7.2f}% {v['blocks_produced']:>8}")
 
 
+def cmd_unban_peer(args):
+    """Clear a stale peer ban on the local node.
+
+    Wraps the admin RPC `unban_peer` so the operator's escape hatch
+    for the 2026-05-22-style stale-ban scenario is a one-liner
+    instead of "hand-edit ban_scores.json + restart the daemon".
+    Auth token is auto-resolved from <data_dir>/rpc_auth_token on
+    same-host invocations (1.88.3+); remote callers must set
+    MESSAGECHAIN_RPC_AUTH_TOKEN to the daemon's token.
+    """
+    host, port = _parse_server_local_default(args.server)
+
+    from client import rpc_call
+    data_dir = getattr(args, "data_dir", None)
+    response = rpc_call(
+        host, port, "unban_peer", {"address": args.address},
+        data_dir=data_dir,
+    )
+    if not response.get("ok"):
+        err = response.get("error", "Could not connect")
+        print(f"Error: {err}")
+        if "Authentication" in str(err):
+            print(
+                "Hint: the admin RPC token is auto-read from "
+                "<data_dir>/rpc_auth_token when the CLI is invoked "
+                "as the same user as the daemon.  If you're running "
+                "as a different user OR against a remote node, set "
+                "MESSAGECHAIN_RPC_AUTH_TOKEN to the daemon's token "
+                "(persisted at <data_dir>/rpc_auth_token on the "
+                "daemon's host)."
+            )
+        sys.exit(1)
+
+    msg = (response.get("result") or {}).get("message", "Unbanned")
+    print(f"{msg}.")
+
+
 def cmd_peers(args):
     """List peers connected to the target node, with metadata."""
     # Default to LOCAL node: "who is MY node connected to" is a
@@ -8202,7 +8276,9 @@ def cmd_upgrade(args):
     """
     import datetime as _dt
     import shutil
+    import sqlite3
     import subprocess
+    import time
 
     from messagechain import __version__ as _current_version
 
@@ -8385,25 +8461,67 @@ def cmd_upgrade(args):
     # `--service-user` carries a user:group spec for chown, but `sudo -u`
     # only accepts a user.  Strip the group portion before invoking sudo.
     smoke_user = args.service_user.split(":", 1)[0]
+    # Best-effort: WAL-checkpoint the running daemon's SQLite WAL
+    # before the smoke subprocess opens chain.db read-only.  Without
+    # this, the smoke test contends for SQLite reader slots with the
+    # running daemon's open WAL and can stall for tens of seconds on
+    # a busy node.  We saw this on 2026-05-22: smoke test timed out
+    # at 120s on validator-2 even though an isolated cold-load took
+    # ~5s once the daemon was idle.  PRAGMA wal_checkpoint(TRUNCATE)
+    # forces the WAL to flush into the main db file, leaving the WAL
+    # empty -- subsequent readers see consistent state without WAL
+    # walking overhead.
     try:
-        smoke = subprocess.run(
+        with sqlite3.connect(
+            os.path.join(args.data_dir, "chain.db"), timeout=5,
+        ) as _ckpt:
+            _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+    except Exception as _e:
+        # Best-effort: a busy/locked db just means the smoke test
+        # pays normal WAL-walking overhead.  Not fatal.
+        logger.debug("pre-smoke WAL checkpoint failed: %s", _e)
+
+    # Run the smoke test with one retry on TimeoutExpired.  The
+    # 2026-05-22 outage saw the first attempt time out at 120s on a
+    # busy node and the second attempt (after the daemon had idled)
+    # finish in ~5s.  Bumping the per-attempt cap to 300s makes
+    # legitimate slow-disk environments (HDD validators on a 10M+
+    # block chain) pass while keeping the retry path as a circuit
+    # breaker for transient IO contention.
+    def _run_smoke():
+        return subprocess.run(
             [
                 "sudo", "-n", "-u", smoke_user,
                 "python3", "-c", smoke_code,
                 clone_dir, args.data_dir,
             ],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=300,
         )
+    try:
+        smoke = _run_smoke()
     except subprocess.TimeoutExpired:
-        try:
-            shutil.rmtree(clone_dir)
-        except OSError:
-            pass
-        _fail(
-            "cold-load smoke test timed out (>120s); service untouched "
-            "and still running on prior binary.  The new binary may "
-            "hang during chain replay -- investigate before retrying."
+        _say(
+            "Cold-load smoke test slow (>300s on first attempt); "
+            "retrying once after a 10s pause to let SQLite checkpointing "
+            "settle..."
         )
+        time.sleep(10)
+        try:
+            smoke = _run_smoke()
+        except subprocess.TimeoutExpired:
+            try:
+                shutil.rmtree(clone_dir)
+            except OSError:
+                pass
+            _fail(
+                "cold-load smoke test timed out (>300s) on both attempts; "
+                "service untouched and still running on prior binary.  "
+                "The new binary may hang during chain replay -- investigate "
+                "before retrying.  Common cause: a wire-format activation "
+                "height was crossed under an older binary that lacked the "
+                "corresponding code (see 'Recovery: missed-runway hard "
+                "fork' in the runbook)."
+            )
     if smoke.returncode != 0:
         try:
             shutil.rmtree(clone_dir)
@@ -9369,6 +9487,7 @@ def main():
         "proposals": cmd_proposals,
         "validators": cmd_validators,
         "peers": cmd_peers,
+        "unban-peer": cmd_unban_peer,
         "receipt": cmd_receipt,
         "submit-evidence": cmd_submit_evidence,
         "cut-checkpoint": cmd_cut_checkpoint,

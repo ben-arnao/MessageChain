@@ -25,20 +25,38 @@ from messagechain.validation import safe_json_loads
 def rpc_call(
     host: str, port: int, method: str, params: dict,
     auth: str | None = None,
+    data_dir: str | None = None,
 ) -> dict:
     """Send an RPC request to the server and return the response.
 
-    `auth`: optional admin-method auth token.  When omitted, the
-    `MESSAGECHAIN_RPC_AUTH_TOKEN` env var is consulted -- this lets a
-    co-resident CLI invocation (operator on the same host as the
-    daemon) inherit the same secret the daemon was started with
-    without forcing every call site to thread it through.  The
-    server only checks the token for methods in `_ADMIN_RPC_METHODS`,
-    so an unset token only matters when calling those methods.
+    `auth`: optional admin-method auth token.  Resolution order:
+      1. explicit `auth` argument (highest priority)
+      2. `MESSAGECHAIN_RPC_AUTH_TOKEN` env var
+      3. `<data_dir>/rpc_auth_token` file (1.88.3+: written by the
+         daemon at startup with mode 0600).  This is the same-host
+         autopilot path -- a CLI running as the same user as the
+         daemon picks up the token without any env-var setup.
+
+    The server only checks the token for methods in
+    `_ADMIN_RPC_METHODS`, so an unresolved token only matters when
+    calling those (ban_peer, unban_peer, get_banned_peers,
+    reserve_leaf, ...).
     """
     import os as _os
     if auth is None:
         auth = _os.environ.get("MESSAGECHAIN_RPC_AUTH_TOKEN") or None
+    if auth is None and data_dir:
+        # Same-host autopilot: read the daemon's persisted token.
+        # Best-effort -- a read failure (file missing, permission
+        # denied, daemon on different host) silently falls through so
+        # public methods still work; admin methods will 401 with a
+        # clear error from the server.
+        token_path = _os.path.join(data_dir, "rpc_auth_token")
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                auth = f.read().strip() or None
+        except OSError:
+            auth = None
     payload = {"method": method, "params": params}
     if auth is not None:
         payload["auth"] = auth
