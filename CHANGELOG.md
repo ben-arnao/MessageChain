@@ -4,6 +4,64 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.89.0] — 2026-05-22
+
+Operator-recovery surface added after the same-day 2026-05-22 stale-ban
+incident.  No consensus changes; this is purely about reducing the
+time-to-recovery for the class of operational footgun the incident
+surfaced.
+
+### Added
+
+* **``messagechain unban-peer <host:port>``** CLI subcommand.  Wraps
+  the existing ``unban_peer`` admin RPC so the operator can clear a
+  stale peer ban with a one-liner instead of hand-editing
+  ``ban_scores.json`` + restarting the daemon.  Same-host
+  invocations autoread the admin token from the new persisted
+  ``<data_dir>/rpc_auth_token`` file (see below), so no env-var
+  setup is required.  Cross-host invocations still use the
+  ``MESSAGECHAIN_RPC_AUTH_TOKEN`` env var path.  Prints a clear
+  authentication hint when the token can't be resolved.  (`7de76d6`)
+* **Daemon persists its generated RPC auth token** to
+  ``<data_dir>/rpc_auth_token`` (mode 0600, atomic ``tmp +
+  os.replace``) at startup.  Pre-1.89.0 the auto-generated token
+  lived only in process memory, so an operator who needed an admin
+  RPC (``unban_peer``, ``ban_peer``, ``get_banned_peers``,
+  ``reserve_leaf``, ...) had to either pre-export the token in the
+  systemd unit (no production deployment does this) or fish it out
+  of process memory.  The 2026-05-22 outage forced the recovery
+  path through ``ban_scores.json`` hand-editing precisely because
+  this surface didn't exist.  Best-effort write: a failure logs at
+  WARNING and the env-var fallback still works.  (`7de76d6`)
+* **``client.rpc_call(data_dir=...)``** parameter.  Resolution
+  order: explicit ``auth`` arg → ``MESSAGECHAIN_RPC_AUTH_TOKEN``
+  env var → ``<data_dir>/rpc_auth_token`` file.  Same-host CLI
+  inherits the daemon's token transparently.  (`7de76d6`)
+
+### Changed
+
+* **Upgrade-CLI cold-load smoke test hardened against IO contention**.
+  On 2026-05-22 the smoke test timed out at 120s on validator-2
+  because the running daemon was IO-contending on the SQLite WAL;
+  an isolated cold-load took ~5s when the daemon was idle.  Three
+  defenses: (a) ``PRAGMA wal_checkpoint(TRUNCATE)`` runs against
+  the live chain.db before spawning the smoke subprocess, flushing
+  the WAL into the main db file so the smoke reader doesn't pay
+  WAL-walking overhead; (b) per-attempt timeout bumped 120s → 300s
+  for HDD / large-chain environments; (c) on ``TimeoutExpired``,
+  the smoke test retries once after a 10s settle pause.  The
+  double-timeout failure message names both attempts so an
+  operator knows the retry already fired.  (`7de76d6`)
+
+### Operator note
+
+The audit r45 #1 strict-newer-semver gate on
+``clear_ban_on_version_change`` stays as-is.  Relaxing it (e.g. to
+clear on PID change instead of version change) would re-open the
+ban-bypass attack surface that gate exists to close.  The new
+``unban-peer`` CLI is the right operator escape hatch for the
+stale-ban scenario, not a loosened auto-clear policy.
+
 ## [1.88.2] — 2026-05-22
 
 Two same-day hotfixes for the public Create Account flow on
