@@ -1000,6 +1000,39 @@ def build_parser() -> argparse.ArgumentParser:
              "queries YOUR local node's peer table)",
     )
 
+    # --- prune-fork-branches ---
+    # Operator recovery tool for the chain.db pollution scenario seen
+    # on 2026-05-22: validator-1 had 37 non-canonical fork-branch rows
+    # in chain.db left over from the leaf-cursor + state-drift
+    # incident.  The 1.89.0 cold-load ChainIntegrityError correctly
+    # refused to load (good safety -- catches the bug before silent
+    # state divergence), but the operator had no built-in way to
+    # clean up the polluted chain.db short of either splicing a
+    # healthy chain.db from the other validator or hand-crafting
+    # DELETE statements.  This CLI is the third option: walk the
+    # canonical chain from best_tip via prev_hash, then DELETE
+    # every blocks-row whose block_hash is NOT on it.  Pure operator
+    # escape hatch; requires the daemon to be STOPPED first.
+    prune_fork_branches = sub.add_parser(
+        "prune-fork-branches",
+        help="Delete non-canonical fork-branch blocks from chain.db (operator recovery)",
+        description=(
+            "Walk back from the best tip via prev_hash, then DELETE "
+            "every row in the blocks table whose block_hash is NOT on "
+            "the canonical chain.  Use after a fork incident has left "
+            "non-canonical sibling blocks in chain.db that the "
+            "cold-load path can't reconcile (see 1.89.0 release notes "
+            "for the 2026-05-22 incident).  REQUIRES the validator "
+            "daemon to be STOPPED -- a live db lock raises SQLite "
+            "busy errors.  Dry-run first: --dry-run prints the "
+            "planned deletions without touching the file."
+        ),
+    )
+    prune_fork_branches.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what would be deleted; do not modify chain.db",
+    )
+
     # --- unban-peer ---
     # Operator escape hatch for the stale-ban scenario surfaced on
     # 2026-05-22: an honest peer earns a 24h instant-ban for a state-
@@ -1008,7 +1041,7 @@ def build_parser() -> argparse.ArgumentParser:
     # recomputes state, the ban is no longer warranted, but auto-clear
     # can't fire (audit r45 #1 strict-newer-semver gate is intentional
     # and not getting relaxed -- relaxing it re-opens the ban-bypass
-    # attack surface for malicious peers).  Pre-1.88.3 the only fix
+    # attack surface for malicious peers).  Pre-1.89.0 the only fix
     # was hand-editing ban_scores.json + restart.  This CLI wraps the
     # existing `unban_peer` admin RPC so the operator's recovery is a
     # one-liner.
@@ -1022,7 +1055,7 @@ def build_parser() -> argparse.ArgumentParser:
             "peer_version field on the ban record blocks auto-clear "
             "from firing when the bug is fixed via process restart "
             "rather than a version bump.\n\n"
-            "Authentication: needs the RPC admin token (1.88.3+: "
+            "Authentication: needs the RPC admin token (1.89.0+: "
             "auto-read from <data_dir>/rpc_auth_token when same-host; "
             "remote callers set MESSAGECHAIN_RPC_AUTH_TOKEN env var)."
         ),
@@ -6510,6 +6543,141 @@ def cmd_validators(args):
         print(f"  {eid:<20} {v['staked']:>14} {v['stake_pct']:>7.2f}% {v['blocks_produced']:>8}")
 
 
+def cmd_prune_fork_branches(args):
+    """Walk the canonical chain from best_tip via prev_hash, DELETE
+    non-canonical block rows.  Operator recovery tool for the
+    2026-05-22-shape incident (chain.db polluted by fork branches
+    that confuse the 1.89.0 cold-load ChainIntegrityError check).
+
+    Daemon MUST be stopped before running this -- SQLite WAL
+    contention with a live daemon causes 'database is locked'
+    errors mid-transaction, which leaves the prune half-applied.
+    Refuses to run if the data_dir-level node.lock is held.
+    """
+    import os, sqlite3
+    data_dir = getattr(args, "data_dir", None)
+    if not data_dir:
+        print("Error: --data-dir is required for prune-fork-branches.")
+        sys.exit(1)
+    chain_db = os.path.join(data_dir, "chain.db")
+    if not os.path.exists(chain_db):
+        print(f"Error: chain.db not found at {chain_db}")
+        sys.exit(1)
+    # Daemon-running gate: the node.lock file is held while the
+    # validator daemon owns the data_dir.  See
+    # messagechain.storage.data_dir_lock.  If it's locked, refuse
+    # to operate -- pruning while the daemon writes blocks would
+    # corrupt chain.db.
+    lock_path = os.path.join(data_dir, ".node.lock")
+    if os.path.exists(lock_path):
+        import fcntl
+        try:
+            fh = open(lock_path, "r+")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fh.close()
+        except (OSError, BlockingIOError):
+            print(
+                f"Error: the validator daemon appears to be running "
+                f"(data_dir lock at {lock_path} is held).  Stop it "
+                "with `sudo systemctl stop messagechain-validator` "
+                "before pruning."
+            )
+            sys.exit(1)
+    # Walk the canonical chain.
+    con = sqlite3.connect(chain_db, timeout=30)
+    try:
+        # Best tip = the chain_tips row with the highest cumulative_weight.
+        # (Mirrors ChainDB.get_best_tip's selection logic.)
+        cur = con.execute(
+            "SELECT tip_hash, block_number FROM chain_tips "
+            "ORDER BY cumulative_weight DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if row is None:
+            print("Error: chain_tips is empty -- chain.db has no tips.")
+            sys.exit(1)
+        tip_hash, tip_height = bytes(row[0]), int(row[1])
+
+        # Walk back via prev_hash collecting canonical hashes.
+        canonical: set[bytes] = set()
+        current = tip_hash
+        for _ in range(tip_height + 2):
+            canonical.add(current)
+            cur = con.execute(
+                "SELECT prev_hash, block_number FROM blocks "
+                "WHERE block_hash = ? LIMIT 1",
+                (current,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                break  # walked off the stored prefix
+            prev = bytes(row[0])
+            if prev == b"\x00" * 32:
+                break  # genesis
+            current = prev
+
+        total_rows = con.execute("SELECT count(*) FROM blocks").fetchone()[0]
+        # All rows whose block_hash is NOT in canonical = fork branches.
+        # Use a temp table to avoid a huge IN-clause for large canonical sets.
+        con.execute("CREATE TEMP TABLE _canonical_hashes (h BLOB PRIMARY KEY)")
+        con.executemany(
+            "INSERT INTO _canonical_hashes(h) VALUES (?)",
+            [(h,) for h in canonical],
+        )
+        to_delete = con.execute(
+            "SELECT block_number, length(data), hex(block_hash) FROM blocks "
+            "WHERE block_hash NOT IN (SELECT h FROM _canonical_hashes) "
+            "ORDER BY block_number, block_hash LIMIT 100"
+        ).fetchall()
+        delete_count = con.execute(
+            "SELECT count(*) FROM blocks "
+            "WHERE block_hash NOT IN (SELECT h FROM _canonical_hashes)"
+        ).fetchone()[0]
+
+        print(f"chain.db: {chain_db}")
+        print(f"canonical tip: hash={tip_hash.hex()[:16]}... height={tip_height}")
+        print(f"canonical chain length: {len(canonical)} blocks")
+        print(f"total rows in blocks table: {total_rows}")
+        print(f"non-canonical rows to delete: {delete_count}")
+        if delete_count == 0:
+            print("chain.db is clean -- nothing to prune.")
+            con.close()
+            return
+        print()
+        print("First few rows that would be deleted (height, size, hash):")
+        for bn, sz, h in to_delete[:20]:
+            print(f"  #{bn:>6}  {sz:>6}B  {h[:32]}...")
+        if delete_count > 20:
+            print(f"  ... and {delete_count - 20} more")
+        if args.dry_run:
+            print()
+            print("Dry-run: no changes made.  Re-run without --dry-run to apply.")
+            con.close()
+            return
+
+        print()
+        print("Applying...")
+        con.execute(
+            "DELETE FROM blocks "
+            "WHERE block_hash NOT IN (SELECT h FROM _canonical_hashes)"
+        )
+        # Also drop chain_tips rows that point at non-canonical tips
+        # (the canonical tip stays; siblings get removed).
+        con.execute(
+            "DELETE FROM chain_tips WHERE tip_hash != ?",
+            (tip_hash,),
+        )
+        con.commit()
+        # Reclaim disk space.  VACUUM rebuilds the db file and can
+        # take a while on a 1.6GB chain; warn so the operator knows.
+        print("Running VACUUM to reclaim disk space (may take a few seconds)...")
+        con.execute("VACUUM")
+        print(f"Done.  Deleted {delete_count} non-canonical block rows.")
+    finally:
+        con.close()
+
+
 def cmd_unban_peer(args):
     """Clear a stale peer ban on the local node.
 
@@ -9488,6 +9656,7 @@ def main():
         "validators": cmd_validators,
         "peers": cmd_peers,
         "unban-peer": cmd_unban_peer,
+        "prune-fork-branches": cmd_prune_fork_branches,
         "receipt": cmd_receipt,
         "submit-evidence": cmd_submit_evidence,
         "cut-checkpoint": cmd_cut_checkpoint,
