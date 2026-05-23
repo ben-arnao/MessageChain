@@ -4,6 +4,52 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.90.0] — 2026-05-23
+
+Second operator-recovery tool from the 2026-05-22 incident review.
+The 1.89.0 ChainIntegrityError invariant correctly refused to load
+v1's chain.db because it had 37 non-canonical fork-branch rows left
+over from the leaf-cursor + state-drift cascade -- but the operator
+had no built-in way to clean those up.  Recovery required either
+splicing a healthy chain.db from the other validator or hand-crafting
+DELETE statements against SQLite directly.  1.90.0 ships the third
+option as a first-class CLI.  No consensus changes.
+
+### Added
+
+* **``messagechain prune-fork-branches``** CLI subcommand.  Walks
+  back from the canonical best_tip via prev_hash to enumerate the
+  canonical chain, then DELETEs every row in the ``blocks`` table
+  whose ``block_hash`` is NOT on it.  Also drops ``chain_tips``
+  rows pointing at non-canonical siblings, and VACUUMs at the end
+  to reclaim disk space.  Use after a fork incident has left
+  non-canonical sibling blocks in chain.db that the cold-load path
+  can't reconcile.  Safety rails:
+
+  * ``--data-dir`` is required (no implicit defaults that could
+    prune the wrong db).
+  * Refuses to operate when the validator daemon's ``node.lock`` is
+    held -- SQLite WAL contention with a live writer would leave
+    the prune half-applied and chain.db corrupt.  Operator must
+    ``sudo systemctl stop messagechain-validator`` first.
+  * ``--dry-run`` prints the planned deletions without mutating
+    chain.db.  Always run dry-run first on a real chain.
+
+  Regression coverage in
+  ``tests/test_prune_fork_branches_cli.py``.  (`1f432fd`)
+
+### Operator note
+
+Combined with 1.89.0's ``unban-peer`` + persisted RPC auth token,
+the operator-recovery surface for the 2026-05-22-class incident now
+has three first-class commands instead of three hand-edits:
+
+* ``unban-peer`` — clears a stale ``ban_scores.json`` entry
+* ``prune-fork-branches`` — cleans a chain.db polluted by non-
+  canonical sibling blocks
+* The ``upgrade`` smoke test now WAL-checkpoints + retries on
+  timeout, so transient IO contention no longer aborts upgrades
+
 ## [1.89.0] — 2026-05-22
 
 Operator-recovery surface added after the same-day 2026-05-22 stale-ban
