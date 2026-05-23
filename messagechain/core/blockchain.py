@@ -1374,14 +1374,25 @@ class Blockchain:
                     latest_height,
                 )
 
-        # Load-time invariant (1.52.0).  After all rehydration paths,
-        # the per-entity state_root computed from the loaded dicts MUST
-        # equal the latest block's stored header.state_root.  If it
-        # doesn't, the load was incomplete -- some consensus-critical
-        # field is missing from chaindb AND from the snapshot.  Fail
-        # LOUDLY here at startup rather than silently producing
-        # divergent state_roots on the next received block (which is
-        # how every bug from 1.50-1.51.4 manifested).
+        # Load-time invariant (1.52.0; 1.91.0 self-heal).  After all
+        # rehydration paths, the per-entity state_root computed from
+        # the loaded dicts MUST equal the latest block's stored
+        # header.state_root.  If it doesn't, the load was incomplete
+        # OR a prior process on this node ran on a fork and wrote
+        # fork-state into chaindb tables / state_snapshots (the
+        # 2026-05-22 v1 incident).
+        #
+        # Recovery: replay every canonical block from genesis.  The
+        # canonical block chain is the inviolate source of truth --
+        # ``block_hash`` is hash-of-contents, so chain entries are
+        # exactly what the network produced regardless of how poisoned
+        # the snapshot/tables are.  Pre-1.91.0 this raised immediately
+        # and required an operator to splice a healthy chain.db or
+        # hand-craft DELETEs.  The self-heal makes the safety net into
+        # a self-recovery mechanism: same detection, same fail-loud on
+        # truly-broken chains, but the common case (snapshot drift
+        # from a prior fork excursion) recovers without manual
+        # intervention.
         #
         # Skipped on the bootstrap-from-checkpoint path (chain has a
         # checkpoint block as its tip whose header.state_root is the
@@ -1393,23 +1404,65 @@ class Blockchain:
             if latest_header_root and latest_header_root != b"\x00" * 32:
                 actual_root = self.compute_current_state_root()
                 if actual_root != latest_header_root:
-                    raise ChainIntegrityError(
-                        f"Chain load invariant failed at block "
-                        f"#{latest_block.header.block_number}: "
-                        f"computed state_root "
-                        f"{actual_root.hex()[:16]}... does not match "
-                        f"stored header state_root "
-                        f"{latest_header_root.hex()[:16]}...  This "
-                        f"means cold-load left some consensus-"
-                        f"critical in-memory accumulator at an empty "
-                        f"default while a long-running node has it "
-                        f"populated.  The next received block would "
-                        f"silently fail to apply with 'Invalid "
-                        f"state_root' -- this assertion catches the "
-                        f"defect at startup instead.  Fix: ensure "
-                        f"snapshot-on-apply is writing the missing "
-                        f"field, OR add the field's persistence path "
-                        f"to ``_load_from_db``."
+                    logger.warning(
+                        "Cold-load state_root mismatch at block "
+                        "#%d: computed %s... != header %s...  "
+                        "Likely cause: a prior process on this node "
+                        "ran on a fork and wrote fork-state into "
+                        "chaindb tables / state_snapshots.  "
+                        "Attempting self-heal via replay-from-"
+                        "genesis using the (inviolate) canonical "
+                        "block chain.",
+                        latest_block.header.block_number,
+                        actual_root.hex()[:16],
+                        latest_header_root.hex()[:16],
+                    )
+                    ok, reason = self._replay_state_from_genesis()
+                    if not ok:
+                        raise ChainIntegrityError(
+                            f"Cold-load self-heal failed at block "
+                            f"#{latest_block.header.block_number}: "
+                            f"{reason}.  Replay-from-genesis could "
+                            f"not be initiated -- the chain.db's "
+                            f"genesis block is unusable.  Operator "
+                            f"recovery: splice a healthy chain.db "
+                            f"from a peer."
+                        )
+                    healed_root = self.compute_current_state_root()
+                    if healed_root != latest_header_root:
+                        raise ChainIntegrityError(
+                            f"Cold-load self-heal completed but "
+                            f"state_root still mismatches at block "
+                            f"#{latest_block.header.block_number}: "
+                            f"replayed {healed_root.hex()[:16]}... "
+                            f"!= header "
+                            f"{latest_header_root.hex()[:16]}...  "
+                            f"This is the truly-broken case: "
+                            f"replaying every canonical block from "
+                            f"genesis still does not produce the "
+                            f"header state_root.  Either the "
+                            f"chain.db's block data is corrupted, "
+                            f"or a consensus rule has changed since "
+                            f"these blocks were minted (e.g. a hard "
+                            f"fork was missed).  Operator recovery: "
+                            f"splice a healthy chain.db from a peer."
+                        )
+                    # Overwrite the poisoned chaindb tables AND the
+                    # bad state_snapshots row at tip_height with the
+                    # rebuilt state, so the next cold-load uses
+                    # correct state without re-triggering self-heal.
+                    self._dirty_entities = None
+                    self._persist_state()
+                    self._persist_state_snapshot(
+                        latest_block.header.block_number,
+                    )
+                    logger.info(
+                        "Cold-load self-heal succeeded at block "
+                        "#%d: state rebuilt from %d canonical "
+                        "blocks; chaindb tables and state_snapshots "
+                        "row overwritten with rebuilt state.",
+                        latest_block.header.block_number,
+                        len(self.chain),
                     )
 
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
@@ -16735,6 +16788,82 @@ class Blockchain:
             f"rewound {rolled_back_count} blocks to height "
             f"{target_height}"
         )
+
+    def _replay_state_from_genesis(self) -> tuple[bool, str]:
+        """Rebuild in-memory state by replaying every canonical block.
+
+        Used by the cold-load self-heal path in ``_load_from_db`` when
+        the loaded state_root does not match the latest block's stored
+        header.state_root.  The scenario this exists for: a prior
+        process on this node ran on a fork (different sibling at some
+        height), wrote fork-state into chaindb tables / state_snapshots,
+        and either crashed or was recovered by an operator running
+        ``prune-fork-branches`` to delete the fork siblings -- leaving
+        canonical blocks in chain.db but a fork-state snapshot/tables.
+
+        The canonical block chain is the only inviolate source of
+        truth: ``block_hash`` is hash-of-contents, so any block in
+        ``self.chain`` is exactly what the network produced.  Replaying
+        from genesis using the canonical blocks deterministically
+        rebuilds state to what a long-running node would have at the
+        same tip, regardless of how poisoned the snapshot/tables were.
+
+        Pattern mirrors the legacy fallback path inside ``_reorganize``
+        (reset + re-apply genesis allocations + forward-walk
+        ``_apply_block_state``), with the post-1.71.1 fix of also
+        calling ``_process_attestations`` and ``_record_stake_snapshot``
+        per replayed block -- without these, ``self.reputation`` and
+        the pinned stake map stay frozen at their post-reset values
+        while long-running peers have them bumped along the canonical
+        chain, producing a divergent state_root the moment the chain
+        advances.
+
+        Returns ``(ok, reason)``.  On success the caller should
+        ``_persist_state`` + ``_persist_state_snapshot`` to overwrite
+        the poisoned chaindb tables and the bad snapshot row.
+        """
+        if not self.chain:
+            return False, "no canonical chain to replay"
+
+        genesis_block = self.chain[0]
+        import messagechain.config as _cfg
+        pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+        is_mainnet_genesis = (
+            pinned is not None
+            and pinned == getattr(_cfg, "_MAINNET_GENESIS_HASH", None)
+            and genesis_block.block_hash == pinned
+        )
+
+        self._reset_state()
+
+        if is_mainnet_genesis:
+            ok, reason = self._apply_mainnet_genesis_supply_state(
+                genesis_block,
+            )
+            if not ok:
+                return False, (
+                    f"genesis supply restore failed: {reason}"
+                )
+        else:
+            # Non-mainnet chain (test fixture or testnet): genesis
+            # allocations are not persisted in chaindb and cannot be
+            # auto-restored from block 0 alone.  Replay will likely
+            # produce divergent state -- the caller's post-replay
+            # state_root recheck will catch this and raise.
+            logger.warning(
+                "Cold-load self-heal on non-mainnet chain: genesis "
+                "allocations cannot be auto-restored.  Replay may "
+                "produce divergent state."
+            )
+
+        for blk in self.chain:
+            if blk.header.block_number > 0:
+                self._apply_block_state(blk)
+                self._process_attestations(blk, self.supply.staked)
+                self._record_stake_snapshot(blk.header.block_number)
+
+        self._rebuild_state_tree()
+        return True, "ok"
 
     def _reset_state(self):
         """Reset in-memory state to genesis defaults for replay.

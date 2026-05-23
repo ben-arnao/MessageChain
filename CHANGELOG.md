@@ -4,6 +4,52 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.91.0] — 2026-05-23
+
+Cold-load self-heal for snapshot drift.  Third operator-recovery
+addition stemming from the 2026-05-22 v1 chain.db pollution incident.
+No consensus changes.
+
+### Added
+
+* **Cold-load self-heal for snapshot drift.**  The 1.89.0
+  ``ChainIntegrityError`` correctly detected when a cold-load
+  produced a ``state_root`` that did not match the latest block's
+  stored ``header.state_root`` (the symptom of a prior process on
+  this node having run on a fork and written fork-state into
+  ``chaindb`` tables / ``state_snapshots``) and refused to start;
+  recovery required either splicing a healthy chain.db from a peer
+  or running ``prune-fork-branches`` to clean siblings + manually
+  deleting the bad ``state_snapshots`` rows.  1.91.0 turns the same
+  safety net into a self-recovery mechanism: when the drift is
+  detected, replay every canonical block from genesis (the canonical
+  block chain is the inviolate source of truth -- ``block_hash`` is
+  hash-of-contents, so any block in chain.db is exactly what the
+  network produced regardless of how poisoned the snapshot/tables
+  are), overwrite the poisoned ``chaindb`` tables and the bad
+  ``state_snapshots`` row at tip_height with the rebuilt state, and
+  continue startup.
+
+  Replay path is the same one ``_reorganize`` uses for legacy
+  snapshot-pruned reorgs: ``_reset_state`` →
+  ``_apply_mainnet_genesis_supply_state`` → forward-walk
+  ``_apply_block_state`` + ``_process_attestations`` +
+  ``_record_stake_snapshot`` per block.  Extracted as
+  ``_replay_state_from_genesis`` so the same primitive can be used
+  by future recovery paths.  Post-replay re-verification of
+  ``state_root`` is the new fail-loud check: if the rebuilt state
+  still does not match the canonical tip's claimed root (chain.db
+  block data corrupted, genesis pin drifted, missed hard fork),
+  ``ChainIntegrityError`` is raised with a message identifying it
+  as a post-self-heal mismatch (operator hint: splice a healthy
+  chain.db from a peer).
+
+  Retires the operator-intervention requirement of the 1.90.0
+  ``prune-fork-branches`` CLI for the snapshot-drift subset of
+  chain.db pollution.  The CLI is still useful for other recovery
+  scenarios (manual chain.db edits, non-snapshot-drift fork-row
+  leaks).
+
 ## [1.90.0] — 2026-05-23
 
 Second operator-recovery tool from the 2026-05-22 incident review.
