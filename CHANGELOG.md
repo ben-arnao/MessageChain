@@ -4,6 +4,48 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.92.0] — 2026-05-26
+
+Operator-facing log clarity in ``equivocation_watcher``.  No
+consensus changes.  Bug-class: observability bug that caused
+operator alarm during long liveness stalls.
+
+### Changed
+
+* **Equivocation-detection WARNING no longer claims an outcome it
+  doesn't deliver.**  Pre-1.92.0 ``EquivocationWatcher._observe``
+  logged ``"Equivocation detected: validator=... — filing slash
+  evidence"`` whenever it saw two byte-different signed payloads at
+  the same ``(validator, height, round)``.  But the watcher has
+  FOUR outcome paths in ``_emit_slash`` and only ONE of them
+  actually files a slash tx: the others -- self-equivocation (audit
+  r41 #3 guard), already-processed evidence (dedup), detect-only
+  mode (no submitter), and decode-error -- all skip emission.  The
+  detection log was a lie in three of four cases.
+
+  Observed effect: between 2026-05-23 and 2026-05-26, validator-2
+  on mainnet logged 200+ ``"Equivocation detected ... filing slash
+  evidence"`` lines while validator-1 was down for an unrelated
+  disk-full incident.  The r41 #3 self-slash guard was correctly
+  suppressing emission the entire time (the chain was
+  operationally safe), but the misleading detection text obscured
+  that fact and made the journal look like v2 was self-slashing.
+
+  Fix: the detection WARNING now ends with ``-- evaluating slash
+  emission (see follow-up log line)`` and points at the paired
+  decision log line.  A new ``"Slash evidence emitted to mempool:
+  offender=... type=..."`` WARNING fires from the success path in
+  ``_emit_slash``.  Every detection event now has exactly one
+  matching decision line (emitted / self-skipped / decode-failed /
+  failed-to-build), so an operator reading the journal in
+  isolation can always tell whether a slash actually went out.
+  The substantive r41 #3 self-slash guard is unchanged.
+
+  Reinforces the CLAUDE.md "honest operators are insured against
+  accidents" anchor at the observability layer: an operator
+  scanning the journal during a liveness stall must not be misled
+  into thinking their honest node is self-slashing when it isn't.
+
 ## [1.91.0] — 2026-05-23
 
 Cold-load self-heal for snapshot drift.  Third operator-recovery

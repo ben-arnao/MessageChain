@@ -298,9 +298,22 @@ class EquivocationWatcher:
 
         # Equivocation — two distinct signed payloads from the same
         # validator at the same (height, round).  Build evidence.
+        # Outcome (slash emitted / self-slash skipped / decode error /
+        # already-processed) is decided inside ``_emit_slash`` and
+        # logged from there -- this line is the detection event only,
+        # so operators reading the journal in isolation can never
+        # infer "slash tx was broadcast" from a single line.  The
+        # original 1.x phrasing ended with "— filing slash evidence",
+        # which was a lie for the self-equivocation / already-
+        # processed / detect-only paths and caused legitimate operator
+        # alarm during 2-validator-1-down liveness stalls (2026-05-23
+        # → 2026-05-26: v2 logged "Equivocation detected ... filing
+        # slash evidence" every 10-20 min for 3 days while the r41 #3
+        # guard was correctly suppressing emission, and the misleading
+        # text obscured that the chain was operationally safe).
         logger.warning(
             "Equivocation detected: validator=%s height=%d type=%s — "
-            "filing slash evidence",
+            "evaluating slash emission (see follow-up log line)",
             validator_id.hex()[:16], height, message_type,
         )
         return self._emit_slash(
@@ -431,4 +444,15 @@ class EquivocationWatcher:
             return None
 
         self.mempool.add_slash_transaction(slash_tx)
+        # Paired follow-up to the detection WARNING in ``_observe``
+        # so every "Equivocation detected" log line is followed by a
+        # decision line ("Slash evidence emitted to mempool" /
+        # "Self-equivocation ... skipping" / "Watcher failed to
+        # decode" / "Failed to build SlashTransaction").  The
+        # already-processed and detect-only-mode early returns above
+        # are deliberately silent (both are common, benign cases).
+        logger.warning(
+            "Slash evidence emitted to mempool: offender=%s type=%s",
+            validator_id.hex()[:16], message_type,
+        )
         return slash_tx
