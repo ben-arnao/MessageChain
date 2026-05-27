@@ -16825,7 +16825,22 @@ class Blockchain:
         if not self.chain:
             return False, "no canonical chain to replay"
 
-        genesis_block = self.chain[0]
+        # Snapshot the canonical chain BEFORE truncating ``self.chain``.
+        # Replay must drive ``self.height`` (which is ``len(self.chain)``)
+        # in lockstep with the block being applied so that every apply-
+        # path call that reads ``self.height`` -- ``_record_key_history``,
+        # ``_update_bootstrap_ratchet``, ``key_rotation_last_height``
+        # writes, and so on -- sees the historical block_number of the
+        # block being applied, not the post-replay tip.  Mirrors the
+        # normal ``_append_block`` ordering: ``_apply_block_state``
+        # runs BEFORE ``self.chain.append(block)``, which is what makes
+        # ``self.height == block.header.block_number`` true during
+        # apply on the live path.  Without this lockstep, replay
+        # records every install at the tip height -- the
+        # 1.93.0 ``compare-state-paths`` diagnostic surfaced this as
+        # ``key_history`` drift on a 3-block test fixture.
+        full_chain = list(self.chain)
+        genesis_block = full_chain[0]
         import messagechain.config as _cfg
         pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
         is_mainnet_genesis = (
@@ -16835,6 +16850,14 @@ class Blockchain:
         )
 
         self._reset_state()
+        # Truncate ``self.chain`` to just the genesis block.  Genesis
+        # state restoration runs at ``self.height == 1`` (matching the
+        # post-``initialize_genesis`` invariant on the live path).
+        # Subsequent ``_apply_block_state`` calls run BEFORE the
+        # corresponding ``self.chain.append``, so ``self.height``
+        # equals ``block.header.block_number`` during apply.
+        self.chain = [genesis_block]
+        self._block_by_hash = {genesis_block.block_hash: genesis_block}
 
         if is_mainnet_genesis:
             ok, reason = self._apply_mainnet_genesis_supply_state(
@@ -16856,11 +16879,18 @@ class Blockchain:
                 "produce divergent state."
             )
 
-        for blk in self.chain:
-            if blk.header.block_number > 0:
-                self._apply_block_state(blk)
-                self._process_attestations(blk, self.supply.staked)
-                self._record_stake_snapshot(blk.header.block_number)
+        for blk in full_chain[1:]:
+            # Apply BEFORE append so ``self.height ==
+            # blk.header.block_number`` during apply (matches the
+            # normal ``_append_block`` ordering).  ``_process_
+            # attestations`` and ``_record_stake_snapshot`` run after
+            # ``_apply_block_state`` on the live path too, so the
+            # same call order is preserved here.
+            self._apply_block_state(blk)
+            self._process_attestations(blk, self.supply.staked)
+            self._record_stake_snapshot(blk.header.block_number)
+            self.chain.append(blk)
+            self._block_by_hash[blk.block_hash] = blk
 
         self._rebuild_state_tree()
         return True, "ok"

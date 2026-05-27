@@ -1070,6 +1070,55 @@ def build_parser() -> argparse.ArgumentParser:
              "operates on YOUR local node's ban table)",
     )
 
+    # --- compare-state-paths ---
+    # Diagnostic for the accumulator-determinism work surfaced by the
+    # 2026-05-26 v1/v2 state-machine divergence at height 2846.  The
+    # 1.91.0 cold-load self-heal only catches SAME-node snapshot-vs-
+    # header inconsistency; it doesn't detect when one node's in-memory
+    # state (cold-loaded from snapshot) silently differs from another
+    # node's (live-accumulated), where both internally believe their
+    # state matches the latest block.header.state_root because the
+    # diverging fields (accumulators like _bootstrap_ratchet,
+    # _immature_rewards, _escrow, validator_archive_misses, ...) are
+    # NOT contributed to state_root.  Drift becomes visible only when
+    # the next block apply uses one of those fields and produces a
+    # state_root the other node rejects.
+    #
+    # This tool runs on a stopped daemon's chain.db and reports
+    # field-by-field drift between two reconstruction paths:
+    #   * Path A (cold-load): the production path -- snapshot row +
+    #     chaindb tables, via Blockchain.__init__'s _load_from_db.
+    #   * Path B (replay-from-genesis): reset state, then apply every
+    #     canonical block from genesis via _replay_state_from_genesis
+    #     (the same primitive the 1.91.0 self-heal uses).
+    #
+    # If the two paths produce identical state, the chain.db is
+    # snapshot-deterministic for the current accumulator set.  If they
+    # differ, the report points at the accumulator that drifted -- the
+    # first target for the determinism fix.
+    compare_state_paths = sub.add_parser(
+        "compare-state-paths",
+        help="Diagnostic: diff cold-load vs replay-from-genesis state (operator/dev)",
+        description=(
+            "Compare two state-reconstruction paths on a chain.db and "
+            "report any field-by-field drift.  Cold-load uses the "
+            "production path (state_snapshots row + per-table loads); "
+            "replay-from-genesis applies every canonical block from "
+            "block 0 using the same primitive the 1.91.0 cold-load "
+            "self-heal uses.  Drift between the two means one or more "
+            "in-memory accumulators are not deterministic functions of "
+            "chain content -- the option (a) work item from the 2026-"
+            "05-26 v1/v2 state-machine divergence.  REQUIRES the "
+            "validator daemon to be STOPPED (same constraint as "
+            "prune-fork-branches)."
+        ),
+    )
+    compare_state_paths.add_argument(
+        "--max-keys", type=int, default=5,
+        help="Per drifted field, print at most this many sample "
+             "differing keys (default 5)",
+    )
+
     # --- receipt ---
     # The receipt command is the user-visible surface that names the
     # protocol's defining property: slashing-backed permanence.  Without
@@ -6678,6 +6727,236 @@ def cmd_prune_fork_branches(args):
         con.close()
 
 
+def cmd_compare_state_paths(args):
+    """Diff cold-load vs replay-from-genesis state on a chain.db.
+
+    Diagnostic for the accumulator-determinism work surfaced by the
+    2026-05-26 v1/v2 state-machine divergence at height 2846 (see
+    1.91.0 release notes).  Reads the chain.db twice via two paths:
+
+      A (cold-load) -- the production path: state_snapshots row
+        verified + restored, plus per-table loads (balances, staked,
+        nonces, public_keys, ...) via Blockchain.__init__'s
+        _load_from_db.
+
+      B (replay-from-genesis) -- reset state, then apply every
+        canonical block from block 0 via _replay_state_from_genesis
+        (the same primitive the 1.91.0 cold-load self-heal uses).
+
+    Captures _snapshot_memory_state() after each path and prints
+    field-by-field drift.  Identical state = chain.db is snapshot-
+    deterministic.  Drift = at least one in-memory accumulator is not
+    a deterministic function of chain content -- the report names the
+    field, which becomes the next target for the determinism refactor.
+
+    Daemon MUST be stopped (same SQLite-WAL-contention constraint as
+    prune-fork-branches).  Read-only on the chain.db: replay mutates
+    only the in-process Blockchain instance, never the on-disk file.
+    """
+    import os
+    data_dir = (
+        getattr(args, "data_dir", None) or "/var/lib/messagechain"
+    )
+    chain_db = os.path.join(data_dir, "chain.db")
+    if not os.path.exists(chain_db):
+        print(f"Error: chain.db not found at {chain_db}")
+        sys.exit(1)
+    # Daemon-running gate -- same idiom as cmd_prune_fork_branches.
+    # Replay mutates only the in-process Blockchain, but holding two
+    # readers of a live SQLite-WAL'd chain.db risks "database is
+    # locked" errors mid-load.  Refuse cleanly instead of half-loading.
+    lock_path = os.path.join(data_dir, ".node.lock")
+    if os.path.exists(lock_path):
+        import fcntl
+        try:
+            fh = open(lock_path, "r+")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fh.close()
+        except (OSError, BlockingIOError):
+            print(
+                f"Error: the validator daemon appears to be running "
+                f"(data_dir lock at {lock_path} is held).  Stop it "
+                "with `sudo systemctl stop messagechain-validator` "
+                "before running compare-state-paths."
+            )
+            sys.exit(1)
+
+    from messagechain.core.blockchain import Blockchain
+    from messagechain.storage.chaindb import ChainDB
+
+    print(f"chain.db: {chain_db}")
+    print("Path A (cold-load): Blockchain.__init__ -> _load_from_db ...")
+    db = ChainDB(chain_db)
+    chain = Blockchain(db=db)
+    tip = chain.chain[-1].header.block_number if chain.chain else -1
+    print(f"  loaded {len(chain.chain)} blocks, tip block_number={tip}")
+    state_a = chain._snapshot_memory_state()
+    print(f"  captured {len(state_a)} top-level state fields")
+
+    print("Path B (replay-from-genesis): _replay_state_from_genesis ...")
+    ok, reason = chain._replay_state_from_genesis()
+    if not ok:
+        print(f"  FAILED: {reason}")
+        print(
+            "  Replay-from-genesis could not be initiated -- the "
+            "diagnostic cannot complete.  Check the chain.db's genesis "
+            "block and the configured mainnet pin."
+        )
+        sys.exit(2)
+    print("  replay completed")
+    state_b = chain._snapshot_memory_state()
+
+    print()
+    print("=== DRIFT REPORT ===")
+    drift = _compare_state_dicts(
+        state_a, state_b, max_keys=args.max_keys,
+    )
+    if drift == 0:
+        print("OK: cold-load and replay-from-genesis produced identical state.")
+        print("    chain.db is snapshot-deterministic for the current "
+              "accumulator set.")
+    else:
+        print()
+        print(
+            f"{drift} top-level field(s) drifted between cold-load and "
+            "replay-from-genesis."
+        )
+        print(
+            "    Each drifted field is a candidate for the option (a) "
+            "accumulator-determinism refactor: either (1) its update "
+            "path is not a pure function of chain content, or (2) its "
+            "persisted form (chaindb table or snapshot blob) is "
+            "incomplete relative to the live-accumulated form."
+        )
+
+
+def _values_equal(a, b) -> bool:
+    """Content-based equality.  Object identity is irrelevant for
+    cross-process / cross-node state comparison.
+
+    Custom objects without ``__eq__`` (e.g. ``EscrowLedger``,
+    ``FinalityTracker``) would otherwise diff as "drifted" purely
+    because cold-load and replay construct distinct instances.  We
+    descend into ``__dict__`` for those to compare contents.
+
+    Recursion handles nested objects (dict-of-objects, list-of-objects)
+    correctly.  Built-in containers (dict, list, set, tuple) get
+    elementwise content comparison; primitives fall through to
+    Python's ``==``.
+    """
+    if a is b:
+        return True
+    # Built-in containers: compare structurally so nested custom
+    # objects also get the content-based treatment.
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_values_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if type(a) is not type(b) or len(a) != len(b):
+            return False
+        return all(_values_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, (set, frozenset)) and isinstance(b, (set, frozenset)):
+        # Sets contain hashable members -- identity-based equality is
+        # fine for hashables (the hash collision that would distinguish
+        # them would also have distinguished them via __hash__).
+        return a == b
+    # Custom objects without __eq__: descend into __dict__ if both
+    # sides have one and neither overrode __eq__.
+    if (
+        type(a) is type(b)
+        and hasattr(a, "__dict__")
+        and not isinstance(a, type)
+        and type(a).__eq__ is object.__eq__
+    ):
+        return _values_equal(a.__dict__, b.__dict__)
+    # Fall back to Python equality (handles primitives, types with
+    # explicit __eq__, and cross-type comparisons).
+    return a == b
+
+
+def _compare_state_dicts(a: dict, b: dict, *, max_keys: int = 5) -> int:
+    """Print field-by-field drift between two _snapshot_memory_state
+    dicts.  Returns the count of top-level fields that drifted.
+
+    Output is one line per matching field (silent), or one section per
+    drifted field with a per-shape summary (dict / set / list /
+    scalar / other) plus up to ``max_keys`` sample differing entries.
+    Uses ``_values_equal`` for content-based comparison so custom
+    objects without ``__eq__`` don't false-positive as drifted.
+    """
+    all_keys = sorted(set(a.keys()) | set(b.keys()))
+    drift_count = 0
+    for key in all_keys:
+        va = a.get(key, "<<MISSING-IN-A>>")
+        vb = b.get(key, "<<MISSING-IN-B>>")
+        if _values_equal(va, vb):
+            continue
+        drift_count += 1
+        if isinstance(va, dict) and isinstance(vb, dict):
+            a_only = set(va.keys()) - set(vb.keys())
+            b_only = set(vb.keys()) - set(va.keys())
+            common = set(va.keys()) & set(vb.keys())
+            changed = sorted(
+                k for k in common if not _values_equal(va[k], vb[k])
+            )
+            print(
+                f"DRIFT [{key}]: dict; "
+                f"cold-only-keys={len(a_only)} "
+                f"replay-only-keys={len(b_only)} "
+                f"changed-keys={len(changed)}"
+            )
+            for k in sorted(a_only)[:max_keys]:
+                print(f"    cold-only      [{_short(k)}] -> {_short(va[k])}")
+            for k in sorted(b_only)[:max_keys]:
+                print(f"    replay-only    [{_short(k)}] -> {_short(vb[k])}")
+            for k in changed[:max_keys]:
+                print(
+                    f"    changed        [{_short(k)}]:  "
+                    f"cold={_short(va[k])}  replay={_short(vb[k])}"
+                )
+        elif isinstance(va, set) and isinstance(vb, set):
+            a_only = sorted(va - vb)
+            b_only = sorted(vb - va)
+            print(
+                f"DRIFT [{key}]: set; cold-only={len(a_only)} "
+                f"replay-only={len(b_only)}"
+            )
+            for x in a_only[:max_keys]:
+                print(f"    cold-only      {_short(x)}")
+            for x in b_only[:max_keys]:
+                print(f"    replay-only    {_short(x)}")
+        elif isinstance(va, list) and isinstance(vb, list):
+            print(
+                f"DRIFT [{key}]: list; cold-len={len(va)} "
+                f"replay-len={len(vb)}"
+            )
+            for i in range(min(len(va), len(vb), max_keys)):
+                if va[i] != vb[i]:
+                    print(
+                        f"    index {i}: cold={_short(va[i])}  "
+                        f"replay={_short(vb[i])}"
+                    )
+        else:
+            print(
+                f"DRIFT [{key}]: cold={_short(va)}  replay={_short(vb)}"
+            )
+    return drift_count
+
+
+def _short(obj, limit: int = 80) -> str:
+    """repr(obj) clipped to ``limit`` chars -- avoids dumping a 1MB
+    dict into the diagnostic output when a single field drifts."""
+    try:
+        s = repr(obj)
+    except Exception as exc:
+        s = f"<unrepresentable: {exc!r}>"
+    if len(s) > limit:
+        return s[: limit - 3] + "..."
+    return s
+
+
 def cmd_unban_peer(args):
     """Clear a stale peer ban on the local node.
 
@@ -9657,6 +9936,7 @@ def main():
         "peers": cmd_peers,
         "unban-peer": cmd_unban_peer,
         "prune-fork-branches": cmd_prune_fork_branches,
+        "compare-state-paths": cmd_compare_state_paths,
         "receipt": cmd_receipt,
         "submit-evidence": cmd_submit_evidence,
         "cut-checkpoint": cmd_cut_checkpoint,

@@ -4,6 +4,87 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.93.0] — 2026-05-27
+
+First landing of the accumulator-determinism work surfaced by the
+2026-05-26 v1/v2 state-machine divergence at height 2846 (the splice
+was the operational fix; this is the start of the structural fix --
+the option (a) work item from the deferred surface).  Includes a
+correctness fix for the 1.91.0 cold-load self-heal AND a diagnostic
+that surfaced the bug and is reusable for finding more.
+
+### Fixed
+
+* **``_replay_state_from_genesis`` now drives ``self.height`` in
+  lockstep with the block being applied.**  Pre-1.93.0 the replay
+  loop iterated ``for blk in self.chain`` without truncating
+  ``self.chain``, so ``self.height`` (which is ``len(self.chain)``)
+  stayed at the post-replay tip throughout the entire loop.  Every
+  apply-path call that reads ``self.height`` -- including
+  ``_record_key_history``, ``_update_bootstrap_ratchet``, and
+  ``key_rotation_last_height`` writes -- recorded the tip height
+  instead of the historical block number, producing in-memory state
+  that silently diverged from what a live-applied node would have at
+  the same height.
+
+  Concretely visible on a 3-block test fixture: ``key_history`` had
+  a key install recorded at block 4 by replay but at block 1 by
+  cold-load (snapshot captured the historical height correctly);
+  ``bootstrap_ratchet_max`` produced a different float value between
+  the two paths.
+
+  Fix: snapshot the canonical chain, truncate ``self.chain`` to
+  just genesis, and append each block AFTER calling
+  ``_apply_block_state`` -- mirroring the live ``_append_block``
+  ordering where ``self.height == block.header.block_number`` during
+  apply.  This makes replay-from-genesis a true deterministic
+  function of chain content for the accumulators currently using
+  ``self.height``, which is exactly the property the option (a)
+  refactor exists to establish.
+
+  Knock-on: improves the 1.91.0 cold-load self-heal correctness --
+  when self-heal triggers (snapshot-vs-header mismatch on cold-
+  load), replay now produces state that matches what other nodes
+  have at the same tip, not the tip-height-stamped variant.
+
+### Added
+
+* **``messagechain compare-state-paths`` diagnostic CLI.**  Reads a
+  chain.db twice via two paths -- cold-load (production:
+  state_snapshots + per-table loads via ``_load_from_db``) vs
+  replay-from-genesis (``_replay_state_from_genesis``) -- and prints
+  field-by-field drift between the resulting in-memory states.
+  Identical = chain.db is snapshot-deterministic for the current
+  accumulator set; drift = at least one in-memory accumulator is
+  not a deterministic function of chain content, and the report
+  names the field.  This is the smallest-possible-reproducer
+  surface for accumulator drift hunts -- exactly how the
+  ``_replay_state_from_genesis`` ordering bug above was found.
+
+  Requires the validator daemon to be STOPPED (same SQLite-WAL-
+  contention constraint as ``prune-fork-branches``).  Read-only on
+  the chain.db: replay mutates only the in-process Blockchain.
+
+  The differ is content-aware (``_values_equal``): objects without
+  ``__eq__`` get their ``__dict__`` compared recursively rather
+  than falling back to identity-based equality, so custom
+  accumulators like ``EscrowLedger`` and ``FinalityTracker`` don't
+  false-positive as drifted just because cold-load and replay
+  construct distinct instances of equal content.
+
+### Known follow-ups (option (a) work item, not addressed in 1.93.0)
+
+* Real-chain drift survey: run ``compare-state-paths`` on
+  validator-1's ``chain.db.pre-splice-20260527-010050`` (the
+  pre-splice backup preserved during the 2026-05-26 splice) and on
+  validator-2's live chain.db.  Any drift surfaced is a candidate
+  for the same ``self.height``-shape fix or a new persistence-path
+  fix.
+* Phase 3 (hard fork): include accumulators in ``state_root`` so
+  consensus enforces determinism at the block where it's violated,
+  not three days later when an accumulator value feeds into a
+  future block's apply path.
+
 ## [1.92.0] — 2026-05-26
 
 Operator-facing log clarity in ``equivocation_watcher``.  No
