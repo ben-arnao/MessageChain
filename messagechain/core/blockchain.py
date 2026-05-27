@@ -16854,6 +16854,34 @@ class Blockchain:
         if not self.chain:
             return False, "no canonical chain to replay"
 
+        # 1.95.0 -- preserve non-state_root accumulators across replay.
+        # ``compute_current_state_root`` only commits to a fixed set of
+        # entity-SMT inputs (balances, staked, nonces, public_keys,
+        # authority_keys, leaf_watermarks, key_rotation_counts,
+        # revoked_entities, slashed_validators, last_active_heights)
+        # plus the reaction_state contribution post-REACT_TX_HEIGHT.
+        # Every OTHER in-memory accumulator (the ones the 2026-05-27
+        # compare-state-paths diagnostic surfaced 25 drift fields in)
+        # is NOT in state_root.  On chains that have been running with
+        # bugs across binary upgrades, those accumulators carry values
+        # that pure-from-blocks replay cannot reproduce -- the chain's
+        # actual history baked the buggy values into headers (state_
+        # root inputs match) but left the accumulators in whatever
+        # state the live apply path produced at the time.
+        #
+        # Replay's job is to rebuild state_root inputs from blocks (so
+        # consensus rules validate); accumulators get RESTORED from
+        # the cold-load snapshot so the chain's actual history is
+        # preserved.  This makes the 1.91.0 cold-load self-heal
+        # finally work correctly for chains with historical drift,
+        # which the 2026-05-26 v1/v2 splice operation existed to
+        # work around.
+        #
+        # Capture the full cold-load state BEFORE ``_reset_state``
+        # blanks it, then merge after replay: state_root inputs from
+        # replay, accumulators from cold.
+        cold_snapshot = self._snapshot_memory_state()
+
         # Snapshot the canonical chain BEFORE truncating ``self.chain``.
         # Replay must drive ``self.height`` (which is ``len(self.chain)``)
         # in lockstep with the block being applied so that every apply-
@@ -16975,6 +17003,17 @@ class Blockchain:
                 self.chain.append(blk)
                 self._block_by_hash[blk.block_hash] = blk
 
+            # 1.95.0 -- restore non-state_root accumulators from the
+            # pre-reset cold snapshot.  State_root inputs (the
+            # ``_rebuild_state_tree`` field set) remain as replay
+            # rebuilt them so consensus validation passes; everything
+            # else gets cold's values to preserve the chain's actual
+            # history (which may differ from what current code's
+            # pure-replay would produce, on chains with historical
+            # binary-version drift).  See ``_apply_replay_accumulator
+            # _restore`` for the exact field list and rationale.
+            self._apply_replay_accumulator_restore(cold_snapshot)
+
             self._rebuild_state_tree()
             return True, "ok"
         finally:
@@ -16985,6 +17024,156 @@ class Blockchain:
             # set and silently disable activations on the next live
             # apply.
             self._replay_skip_activations = None
+
+    # The set of fields that contribute to ``compute_current_state_
+    # root`` -- mirrors ``_rebuild_state_tree``'s ``live_keys`` union
+    # PLUS the reaction_state contribution post-REACT_TX_HEIGHT.
+    # These get rebuilt by replay (consensus-critical: block headers
+    # committed state_roots against them and validation re-checks).
+    # Every OTHER field in ``_snapshot_memory_state`` is treated as
+    # a non-state_root accumulator -- replay produces its own value
+    # but ``_apply_replay_accumulator_restore`` overwrites that with
+    # the cold-load snapshot's value to preserve chain history.
+    _STATE_ROOT_INPUT_FIELDS = frozenset({
+        "balances",
+        "staked",
+        "nonces",
+        "public_keys",
+        "authority_keys",
+        "leaf_watermarks",
+        "key_rotation_counts",
+        "revoked_entities",
+        "slashed_validators",
+        "last_active_heights",
+        # reaction_state contributes via .state_root_contribution()
+        # post-REACT_TX_HEIGHT; the apply path rebuilds it
+        # deterministically from ReactTransactions so replay
+        # produces matching contents on canonical chains.
+        "reaction_state",
+    })
+
+    def _apply_replay_accumulator_restore(
+        self, cold_snapshot: dict,
+    ) -> None:
+        """Restore non-state_root accumulators from the pre-replay
+        cold-load snapshot.
+
+        Replay-from-genesis rebuilds state from block content alone.
+        On chains that have been running across multiple binary
+        versions (the realistic case after a few months on mainnet),
+        the chain's actual in-memory state at the tip may not equal
+        what pure-from-blocks replay produces -- because earlier
+        binaries had different apply-path behavior, and that
+        behavior's outputs are baked into block headers
+        (state_roots committed against the earlier code's results).
+
+        For state_root inputs -- the SMT-contributing fields
+        ``_rebuild_state_tree`` reads -- replay's output is what
+        consensus validates against block headers.  We KEEP those.
+
+        For every other accumulator (per-validator counters,
+        rewards queues, ratchet state, lottery pool, etc.) the
+        chain's actual value at the tip is whatever live apply
+        produced over the chain's lifetime.  Replay's output for
+        these is "what current code thinks the value should be" --
+        useful for a fresh chain, drift-producing for a chain
+        with historical version skew.  We RESTORE these from
+        cold-load so the chain's actual history is preserved.
+
+        End result:
+          * ``state_root`` matches block headers (passes validation)
+          * Non-state_root accumulators match cold-load (preserves
+            history)
+          * The 1.91.0 cold-load self-heal finally works correctly
+            for chains with binary-version drift -- which the
+            2026-05-26 v1/v2 splice operation existed to work
+            around at the operator level.
+
+        Generalises the 1.94.0 replay-skip-activations mechanism
+        from "preserve 3 activation flags" to "preserve every
+        non-state_root field".  The activation-skip is still
+        load-bearing because it ALSO prevents balance cascades
+        (rebase moves tokens; without skip, replay's balances
+        differ from header's balances even with this restore --
+        because we don't restore balances, they're state_root
+        inputs).
+        """
+        # Apply the supply-level scalars and dicts that are NOT in
+        # _STATE_ROOT_INPUT_FIELDS but ARE inside ``self.supply``.
+        # These are the various accumulator scalars and bookkeeping
+        # dicts that ride on the SupplyTracker.  Listed explicitly
+        # so a future field added to ``_snapshot_memory_state``
+        # without explicit handling here surfaces in a drift
+        # report rather than being silently treated wrong.
+        supply_fields_to_restore = (
+            "total_supply",
+            "total_minted",
+            "total_fees_collected",
+            "total_burned",
+            "base_fee",
+            "treasury_rebase_applied",
+            "supply_reconciliation_applied",
+            "supply_reconciliation_fix_applied",
+            "registered_validators",
+            "grandfather_applied",
+            "_treasury_spend_epoch_start",
+            "_treasury_spend_debited_this_epoch",
+            "lottery_prize_pool",
+            "rolling_fee_burn",
+            "rolling_fee_burn_seeded",
+            "attester_epoch_earnings",
+            "attester_fee_pool_this_block",
+            "fee_burn_this_block",
+            "_current_block_height",
+            "pending_unstakes",
+        )
+        for name in supply_fields_to_restore:
+            if name in cold_snapshot:
+                setattr(self.supply, name, cold_snapshot[name])
+
+        # Top-level blockchain accumulators that aren't in supply
+        # but are also non-state_root.  Same explicit listing so
+        # new accumulators raise visibility.
+        blockchain_fields_to_restore = (
+            "wots_tree_heights",
+            "message_counts",  # entity_message_count
+            "proposer_sig_counts",
+            "attestation_sig_counts",
+            "slash_sig_counts",
+            "slash_offense_counts",
+            "key_rotation_last_height",
+            "key_history",
+            "reputation",
+            "_immature_rewards",
+            "_escrow",
+            "_bootstrap_ratchet",
+            "archive_active_snapshot",
+            "validator_archive_misses",
+            "validator_first_active_block",
+            "validator_archive_success_streak",
+            "attester_coverage_misses",
+            "archive_reward_pool",
+            "seed_initial_stakes",
+            "seed_divestment_debt",
+            "receipt_subtree_roots",
+            "past_receipt_subtree_roots",
+            "_processed_evidence",
+            "blocks_since_last_finalization",
+            "finality",
+        )
+        # Map ``_snapshot_memory_state`` key -> attribute name.
+        # Most snapshot keys match attribute names directly.  The
+        # exception is ``message_counts`` (snapshot) ->
+        # ``entity_message_count`` (attribute) -- the asymmetry was
+        # already baked into ``_snapshot_memory_state`` /
+        # ``_restore_memory_snapshot``; we just mirror the existing
+        # mapping here.
+        key_to_attr = {"message_counts": "entity_message_count"}
+        for snap_key in blockchain_fields_to_restore:
+            if snap_key not in cold_snapshot:
+                continue
+            attr_name = key_to_attr.get(snap_key, snap_key)
+            setattr(self, attr_name, cold_snapshot[snap_key])
 
     def _reset_state(self):
         """Reset in-memory state to genesis defaults for replay.

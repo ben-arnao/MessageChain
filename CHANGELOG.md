@@ -4,6 +4,95 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.95.0] — 2026-05-27
+
+Generalises the 1.94.0 replay-skip-activations mechanism from "preserve
+3 activation flags" to "preserve every non-state_root accumulator
+across replay".  This is the structural fix for the entire class of
+drift the 2026-05-27 ``compare-state-paths`` diagnostic surfaced --
+not just the 3 activation flags but all 25 fields.
+
+### Background
+
+``compute_current_state_root`` only commits to a fixed set of
+entity-SMT inputs: ``balances``, ``staked``, ``nonces``,
+``public_keys``, ``authority_keys``, ``leaf_watermarks``,
+``key_rotation_counts``, ``revoked_entities``,
+``slashed_validators``, ``last_active_heights``, plus the
+``reaction_state`` contribution post-REACT_TX_HEIGHT.  Every other
+in-memory accumulator (per-validator counters, rewards queues,
+ratchet state, supply scalars, activation flags, ...) is NOT in
+state_root.
+
+On chains that have been running across multiple binary versions
+(the realistic mainnet case), live apply produced accumulator
+values that pure-from-blocks replay cannot reproduce -- earlier
+binaries had different apply-path behavior, and its outputs are
+baked into block headers (state_roots committed against the earlier
+code's results).  Replay-from-genesis with current code computes
+"what the chain should have been" rather than "what the chain is".
+
+### Fixed
+
+* **``_replay_state_from_genesis`` now preserves all non-state_root
+  accumulators from the pre-replay cold-load snapshot.**  The
+  workflow:
+
+    1. Capture full state via ``_snapshot_memory_state`` BEFORE
+       ``_reset_state``.
+    2. Reset, then run the replay loop -- rebuilds state_root inputs
+       (the SMT-contributing fields) deterministically from blocks.
+    3. Call ``_apply_replay_accumulator_restore(cold_snapshot)``,
+       which sets every non-state_root field back to its cold-load
+       value.
+
+  Result: state_root inputs match what block headers committed
+  (passes consensus validation); accumulators preserve the chain's
+  actual history rather than diverging to what current code would
+  compute.
+
+  The 1.94.0 replay-skip-activations is still load-bearing -- it
+  prevents balance cascades during replay (activations that didn't
+  fire historically mustn't fire during replay or they'd move
+  balances).  Activation flags ARE state_root-adjacent in the sense
+  that they affect SMT inputs (balances etc.), so the skip
+  prevents the cascade and the restore preserves the flag itself.
+
+* **Generalises the 1.91.0 cold-load self-heal to work on chains
+  with binary-version drift.**  Pre-1.95.0, self-heal would
+  produce post-replay state that didn't match block headers on
+  any chain that had crossed an activation height under an
+  earlier binary -- forcing a hard ``ChainIntegrityError`` raise
+  even when the chain was operationally fine.  The 2026-05-26
+  v1/v2 splice operation existed entirely to work around this.
+
+  Post-1.95.0, self-heal replays state_root inputs (consensus-
+  critical: must match block headers to pass validation) AND
+  preserves accumulators (the chain's actual history, not "what
+  current code would produce").  The chain's history is canon
+  per the CLAUDE.md permanence anchor.
+
+### New test contract
+
+* ``test_replay_preserves_simulated_accumulator_drift`` -- builds
+  a 3-block chain, manually poisons ``validator_archive_misses``
+  (a non-state_root accumulator), runs replay, asserts the
+  poisoned value survives.  Pins the "preserve, don't recompute"
+  contract for non-state_root fields.
+
+### Known follow-up (future hard fork)
+
+The long-term structural answer for the entire drift class is
+Phase 3: include ALL state (entity SMT + accumulators) in the
+state_root computation, gated on a future activation height.  At
+activation, consensus enforces accumulator determinism -- any
+non-deterministic apply path immediately fails state_root
+validation on the offending block, rather than accumulating
+silently for months.  1.95.0 lays the groundwork by ensuring the
+chain's current accumulator state is reproducible (via cold-load
+preservation); Phase 3 commits to that state on chain so it
+cannot drift further.
+
 ## [1.94.0] — 2026-05-27
 
 Second landing of the accumulator-determinism work (Phase 2 of option

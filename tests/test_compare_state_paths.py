@@ -250,6 +250,70 @@ class TestColdLoadVsReplayDeterminism(_MainnetPinOverride, unittest.TestCase):
         finally:
             self._restore_all()
 
+    def test_replay_preserves_simulated_accumulator_drift(self):
+        """1.95.0 contract: ``_replay_state_from_genesis`` restores
+        non-state_root accumulators from the pre-replay cold-load
+        snapshot rather than computing them from blocks.  This makes
+        replay match the chain's actual history on chains that have
+        been running across binary versions with apply-path bugs
+        (the 2026-05-26 v1/v2 production state).
+
+        Test: build a clean 3-block chain, simulate accumulator
+        drift by poisoning a non-state_root accumulator
+        (``validator_archive_misses[founder] += 99``), capture the
+        drifted state, run replay-from-genesis, assert replay
+        preserved the poisoned value (didn't reset it to what
+        from-blocks computation would produce).
+        """
+        try:
+            tmp = tempfile.mkdtemp(prefix="mc_compare_test_")
+            self.addCleanup(shutil.rmtree, tmp, True)
+            db_path = os.path.join(tmp, "chain.db")
+
+            chain1, db1 = self._build_chain_with_blocks(
+                db_path, n_blocks=3,
+            )
+
+            # Poison a non-state_root accumulator -- simulates the
+            # historical-drift class of bug.  validator_archive_misses
+            # is per-validator and not contributed to state_root, so
+            # mutating it doesn't break header validation but does
+            # diverge cold-load from replay-from-blocks.
+            poisoned_value = 99
+            chain1.validator_archive_misses[
+                self.founder.entity_id
+            ] = poisoned_value
+
+            cold_snapshot = chain1._snapshot_memory_state()
+            self.assertEqual(
+                cold_snapshot["validator_archive_misses"].get(
+                    self.founder.entity_id, 0,
+                ),
+                poisoned_value,
+                "test setup: cold-load must have the poisoned value",
+            )
+
+            ok, reason = chain1._replay_state_from_genesis()
+            self.assertTrue(ok, reason)
+
+            # 1.95.0 contract: replay restored the poisoned value
+            # from cold snapshot.  Pre-1.95.0 replay would have
+            # rebuilt validator_archive_misses from blocks alone,
+            # losing the poison.
+            replayed_value = chain1.validator_archive_misses.get(
+                self.founder.entity_id, 0,
+            )
+            self.assertEqual(
+                replayed_value, poisoned_value,
+                "Replay must preserve non-state_root accumulator "
+                "values from the pre-replay cold-load snapshot.  "
+                "Lost value = pure-from-blocks replay regression "
+                "of the 1.95.0 preserve-accumulators mechanism.",
+            )
+            _close(db1)
+        finally:
+            self._restore_all()
+
     @unittest.skipIf(
         os.environ.get("PYTEST_XDIST_WORKER") is not None
         and "MC_RUN_SLOW" not in os.environ,
