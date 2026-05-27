@@ -12926,6 +12926,21 @@ class Blockchain:
             return
         if self.supply.treasury_rebase_applied:
             return
+        # 1.94.0 replay-skip: when ``_replay_state_from_genesis`` is
+        # rebuilding state on a chain whose ``treasury_rebase_applied``
+        # flag was False BEFORE the replay (i.e. the activation never
+        # fired in production), skip firing on replay too -- replay
+        # must match the chain's actual history.  See
+        # ``_replay_state_from_genesis`` for the broader rationale
+        # and the 2026-05-27 compare-state-paths drift report that
+        # motivated this.  Fresh chains hit this code path on their
+        # first ever block 704 with ``_replay_skip_activations``
+        # unset (None) -- so the skip dict resolves to empty and the
+        # activation fires as documented.
+        if (
+            getattr(self, "_replay_skip_activations", None) or {}
+        ).get("treasury_rebase"):
+            return
         # If the treasury somehow cannot cover the burn (e.g. operator
         # has mis-set the placeholder activation height to a point
         # deep in chain history where the treasury has already been
@@ -13073,6 +13088,13 @@ class Blockchain:
         if block_height != SUPPLY_RECONCILIATION_FIX_HEIGHT:
             return
         if self.supply.supply_reconciliation_fix_applied:
+            return
+        # 1.94.0 replay-skip: see _apply_treasury_rebase docstring
+        # for the broader rationale; mirrors the same pattern for the
+        # supply-reconciliation-fix activation.
+        if (
+            getattr(self, "_replay_skip_activations", None) or {}
+        ).get("supply_reconciliation_fix"):
             return
         expected = (
             GENESIS_SUPPLY
@@ -13276,6 +13298,13 @@ class Blockchain:
         if block_height != VALIDATOR_REGISTRATION_BURN_HEIGHT:
             return
         if self.supply.grandfather_applied:
+            return
+        # 1.94.0 replay-skip: see _apply_treasury_rebase docstring
+        # for the broader rationale; mirrors the same pattern for
+        # the validator-registration grandfather activation.
+        if (
+            getattr(self, "_replay_skip_activations", None) or {}
+        ).get("grandfather"):
             return
         for eid, amt in self.supply.staked.items():
             if amt > 0:
@@ -16849,7 +16878,59 @@ class Blockchain:
             and genesis_block.block_hash == pinned
         )
 
+        # Snapshot the chain-state one-shot hard-fork application
+        # flags BEFORE ``_reset_state`` blanks them.  Replay must
+        # match the chain's actual history -- an activation that
+        # never fired in production (every running node has the
+        # flag at False) must not fire during replay either, or
+        # replay produces "what the chain would have been if the
+        # activation had fired" instead of "what the chain actually
+        # is".  This is the 2026-05-27 compare-state-paths diagnostic
+        # finding: ``treasury_rebase_applied`` / ``supply_
+        # reconciliation_fix_applied`` / ``grandfather_applied`` were
+        # False on v2's canonical chain.db but True after a naive
+        # replay.  The activation code is correct for fresh chains
+        # (where the flags start False and the code fires them at
+        # the activation height); we only need replay to mirror what
+        # actually happened on chains that missed firing.
+        #
+        # Implementation: stash the historical flag values, set a
+        # ``_replay_skip_activations`` dict on self that activation
+        # functions consult to decide whether to skip on this
+        # particular replay run.  Cleared at end of replay.  On
+        # fresh chains the historical flags are False because no
+        # activation has fired yet, so replay will set skip=True and
+        # the activation functions early-return -- but on fresh
+        # chains the replay loop never reaches the activation height
+        # anyway (test fixtures stop at <100 blocks; activation
+        # heights are >700), so the skip is moot.  The skip only
+        # affects chains where the chain.db has the activation flag
+        # at False AND the chain extends past the activation height.
+        # That's exactly the historical-divergence case we want to
+        # accommodate.
+        skip_dead_activations = {
+            "treasury_rebase": (
+                not self.supply.treasury_rebase_applied
+            ),
+            "supply_reconciliation": (
+                not self.supply.supply_reconciliation_applied
+            ),
+            "supply_reconciliation_fix": (
+                not self.supply.supply_reconciliation_fix_applied
+            ),
+            "grandfather": (
+                not self.supply.grandfather_applied
+            ),
+        }
+
         self._reset_state()
+        # Install the skip table AFTER reset (reset clears the
+        # supply tracker, not the blockchain-level ``_replay_*``
+        # attributes).  The try/finally that closes the function
+        # body below is the only thing that clears this -- if
+        # genesis restoration fails (early return below), the
+        # caller must clear it.
+        self._replay_skip_activations = skip_dead_activations
         # Truncate ``self.chain`` to just the genesis block.  Genesis
         # state restoration runs at ``self.height == 1`` (matching the
         # post-``initialize_genesis`` invariant on the live path).
@@ -16859,41 +16940,51 @@ class Blockchain:
         self.chain = [genesis_block]
         self._block_by_hash = {genesis_block.block_hash: genesis_block}
 
-        if is_mainnet_genesis:
-            ok, reason = self._apply_mainnet_genesis_supply_state(
-                genesis_block,
-            )
-            if not ok:
-                return False, (
-                    f"genesis supply restore failed: {reason}"
+        try:
+            if is_mainnet_genesis:
+                ok, reason = self._apply_mainnet_genesis_supply_state(
+                    genesis_block,
                 )
-        else:
-            # Non-mainnet chain (test fixture or testnet): genesis
-            # allocations are not persisted in chaindb and cannot be
-            # auto-restored from block 0 alone.  Replay will likely
-            # produce divergent state -- the caller's post-replay
-            # state_root recheck will catch this and raise.
-            logger.warning(
-                "Cold-load self-heal on non-mainnet chain: genesis "
-                "allocations cannot be auto-restored.  Replay may "
-                "produce divergent state."
-            )
+                if not ok:
+                    return False, (
+                        f"genesis supply restore failed: {reason}"
+                    )
+            else:
+                # Non-mainnet chain (test fixture or testnet):
+                # genesis allocations are not persisted in chaindb
+                # and cannot be auto-restored from block 0 alone.
+                # Replay will likely produce divergent state -- the
+                # caller's post-replay state_root recheck will catch
+                # this and raise.
+                logger.warning(
+                    "Cold-load self-heal on non-mainnet chain: "
+                    "genesis allocations cannot be auto-restored. "
+                    "Replay may produce divergent state."
+                )
+            for blk in full_chain[1:]:
+                # Apply BEFORE append so ``self.height ==
+                # blk.header.block_number`` during apply (matches
+                # the normal ``_append_block`` ordering).
+                # ``_process_attestations`` and
+                # ``_record_stake_snapshot`` run after
+                # ``_apply_block_state`` on the live path too, so
+                # the same call order is preserved here.
+                self._apply_block_state(blk)
+                self._process_attestations(blk, self.supply.staked)
+                self._record_stake_snapshot(blk.header.block_number)
+                self.chain.append(blk)
+                self._block_by_hash[blk.block_hash] = blk
 
-        for blk in full_chain[1:]:
-            # Apply BEFORE append so ``self.height ==
-            # blk.header.block_number`` during apply (matches the
-            # normal ``_append_block`` ordering).  ``_process_
-            # attestations`` and ``_record_stake_snapshot`` run after
-            # ``_apply_block_state`` on the live path too, so the
-            # same call order is preserved here.
-            self._apply_block_state(blk)
-            self._process_attestations(blk, self.supply.staked)
-            self._record_stake_snapshot(blk.header.block_number)
-            self.chain.append(blk)
-            self._block_by_hash[blk.block_hash] = blk
-
-        self._rebuild_state_tree()
-        return True, "ok"
+            self._rebuild_state_tree()
+            return True, "ok"
+        finally:
+            # Always clear the replay-skip flag so subsequent live
+            # block applies (post-self-heal) see the normal "fire
+            # activations as documented" semantics.  Without this
+            # finally, a crashing replay could leave the skip flag
+            # set and silently disable activations on the next live
+            # apply.
+            self._replay_skip_activations = None
 
     def _reset_state(self):
         """Reset in-memory state to genesis defaults for replay.

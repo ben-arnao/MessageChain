@@ -4,6 +4,110 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.94.0] — 2026-05-27
+
+Second landing of the accumulator-determinism work (Phase 2 of option
+(a)).  1.93.0 made fresh chains snapshot-deterministic by fixing
+``_replay_state_from_genesis``'s self.height ordering bug; 1.94.0
+makes replay match the chain's actual history on chains that missed
+firing one or more one-shot hard-fork activations.
+
+### Background
+
+The 2026-05-27 ``compare-state-paths`` diagnostic surveyed mainnet's
+canonical chain.db and surfaced 25 fields that drift between cold-
+load and replay-from-genesis.  Most of the drift cascades from three
+one-shot hard-fork activations whose ``*_applied`` flags are False
+on every running mainnet node despite chain tip being past every
+activation height:
+
+  * ``TREASURY_REBASE_HEIGHT = 704`` (mainnet at 2850+) -- flag False
+  * ``VALIDATOR_REGISTRATION_BURN_HEIGHT = 713`` -- flag False
+  * ``SUPPLY_RECONCILIATION_FIX_HEIGHT = 1709`` -- flag False
+
+The activation functions themselves are correct.  Mainnet missed
+firing them due to binary-deployment timing -- the binary containing
+the activation code was rolled to validators AFTER the activation
+height, and the activation gate ``if block_height != ACTIVATION_HEIGHT``
+silently lets a post-activation cold-start skip the one-shot
+transformation forever.  The chain proceeded on the no-fire path.
+Every block since is committed against that no-fire state.  The
+chain is internally consistent; just diverged from design intent.
+
+Replay-from-genesis with current 1.93.0 code DOES fire these
+activations -- producing "what the chain would have been" rather
+than "what the chain actually is."  That mismatch means the 1.91.0
+cold-load self-heal cannot recover any mainnet node: post-replay
+state_root would not match the chain's stored header state_roots.
+
+### Fixed
+
+* **``_replay_state_from_genesis`` now skips one-shot activations
+  whose historical flag was False before replay.**  Before
+  ``_reset_state``, the replay captures the current values of
+  ``treasury_rebase_applied`` / ``supply_reconciliation_applied`` /
+  ``supply_reconciliation_fix_applied`` / ``grandfather_applied``.
+  These are the chain's ACTUAL history -- whether each activation
+  fired in production.  Replay installs a ``_replay_skip_activations``
+  dict on the Blockchain instance that activation functions consult.
+  If the historical flag was False, the activation does NOT fire on
+  replay -- matching the chain.  If True, replay fires as normal.
+
+  Fresh chains hit replay paths only via the cold-load self-heal,
+  which only triggers when state is already broken.  At that point
+  the flag is whatever the broken state has (typically False on a
+  fresh chain that hasn't crossed activation heights yet, but
+  activation heights are >700 and test fixtures stop at <100 blocks
+  -- so the skip is moot in practice for fresh chains).  The
+  activation tests (``test_treasury_rebase``,
+  ``test_supply_reconciliation_fix``,
+  ``test_validator_registration_burn``) exercise the non-replay
+  path where activations fire as documented; all pass.
+
+  Cleared in a ``try/finally`` so a crashing replay never leaves
+  the skip flag set and silently disables activations on the next
+  live block apply.
+
+### Why "accept current state as canon" rather than retroactive correction
+
+Two paths were available:
+  1. Hard-fork to retroactively fire the missed activations (33M
+     treasury burn + scalar invariant repair + grandfather backfill).
+  2. Accept the chain's actual no-fire history as canon; make replay
+     mirror it.
+
+Path 1 honours the original design intent but rewrites consensus
+state retroactively -- a precedent that conflicts with the CLAUDE.md
+permanence anchor ("what's on-chain is on-chain").  Path 2 honours
+the chain's actual history -- a chain that's been running internally
+consistent for months gets to keep that history, and the code path
+that didn't fire stays that way.  We pick Path 2.
+
+The activation code itself is preserved unchanged for chains that
+DO fire the activations correctly (new launches, or any chain whose
+binary deployment caught the activation height in time).
+
+### Known remaining drift (Phase 2 ongoing)
+
+Even after activation-skip lands, ``compare-state-paths`` on v2's
+chain.db is expected to surface residual drift in:
+
+  * ``validator_first_active_block`` -- field-added-at-runtime
+    initialization bug (was added to the binary after some validators
+    had already crossed first-active blocks)
+  * ``key_history`` cold-only entries -- 27 entities whose key history
+    landed via a chaindb-mirror path that replay doesn't reconstruct
+  * Various per-validator accumulator counters
+    (``attestation_sig_counts``, ``attester_epoch_earnings``,
+    ``validator_archive_misses``, ``immature_rewards``)
+  * Per-block accumulator lists (``rolling_fee_burn``)
+
+Each is a separate small investigation -- same pattern as the
+activation-skip fix: trace the update path, decide whether to make
+replay match cold-load (preserve history) or fix the cold-load path
+to derive deterministically from chain content.  Future 1.94.x
+releases will land these incrementally.
+
 ## [1.93.0] — 2026-05-27
 
 First landing of the accumulator-determinism work surfaced by the

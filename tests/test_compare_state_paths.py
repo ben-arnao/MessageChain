@@ -152,9 +152,13 @@ class TestColdLoadVsReplayDeterminism(_MainnetPinOverride, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # tree_height=8 gives 256 WOTS+ leaves -- enough for the
+        # 50-block fixture's ~100 signature consumption (proposer +
+        # attestation each block).  tree_height=4 (16 leaves, the
+        # cheapest setting) exhausts at ~10 blocks.
         cls.founder = Entity.create(
             private_key=b"compare-state-paths-test-founder",
-            tree_height=4,
+            tree_height=8,
         )
 
     def _build_chain_with_blocks(self, db_path: str, n_blocks: int):
@@ -189,46 +193,84 @@ class TestColdLoadVsReplayDeterminism(_MainnetPinOverride, unittest.TestCase):
             self.assertTrue(ok, reason)
         return chain, db
 
+    def _assert_zero_drift(self, n_blocks: int):
+        """Build an N-block chain and assert cold-load == replay-from-
+        genesis on every snapshot field.  Used by the parameterized
+        scale tests below.  A failure names the drifted field and the
+        block count where the bug first triggers -- the bisection
+        target for the per-accumulator fix work."""
+        tmp = tempfile.mkdtemp(prefix="mc_compare_test_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        db_path = os.path.join(tmp, "chain.db")
+
+        chain1, db1 = self._build_chain_with_blocks(
+            db_path, n_blocks=n_blocks,
+        )
+        db1.flush_state()
+        _close(db1)
+
+        db2 = ChainDB(db_path)
+        chain2 = Blockchain(db=db2)
+        state_a = chain2._snapshot_memory_state()
+
+        ok, reason = chain2._replay_state_from_genesis()
+        self.assertTrue(ok, reason)
+        state_b = chain2._snapshot_memory_state()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            drift_count = _compare_state_dicts(state_a, state_b)
+        self.assertEqual(
+            drift_count, 0,
+            f"Cold-load vs replay-from-genesis drift detected on a "
+            f"{n_blocks}-block test fixture.  This is the option (a) "
+            f"determinism bug -- the drifted field names a "
+            f"non-deterministic accumulator update path.  Diff "
+            f"output:\n{buf.getvalue()}",
+        )
+        _close(db2)
+
     def test_freshly_built_chain_is_snapshot_deterministic(self):
-        """Test fixture chains MUST be snapshot-deterministic.  If
-        they're not, the diagnostic CLI is broken OR there's a
-        first-order determinism bug that the smallest possible chain
-        already reproduces (great news for fixing it)."""
+        """3 blocks -- the smallest reproducer.  Must be zero drift
+        or even the simplest chain has a determinism bug."""
         try:
-            tmp = tempfile.mkdtemp(prefix="mc_compare_test_")
-            self.addCleanup(shutil.rmtree, tmp, True)
-            db_path = os.path.join(tmp, "chain.db")
+            self._assert_zero_drift(n_blocks=3)
+        finally:
+            self._restore_all()
 
-            # Phase 1: build chain, persist, close.
-            chain1, db1 = self._build_chain_with_blocks(
-                db_path, n_blocks=3,
-            )
-            db1.flush_state()
-            _close(db1)
+    def test_zero_drift_at_15_blocks(self):
+        """15 blocks -- past the first few attestation cycles, picks
+        up any drift triggered by per-block accumulator updates that
+        skip the first 1-2 blocks (e.g. accumulator init paths that
+        only fire post-genesis-warmup).  Any drift here is a genuine
+        determinism bug, not a fork artifact -- the chain is built
+        from scratch by this test."""
+        try:
+            self._assert_zero_drift(n_blocks=15)
+        finally:
+            self._restore_all()
 
-            # Phase 2: cold-load + replay-from-genesis on same chain.db.
-            db2 = ChainDB(db_path)
-            chain2 = Blockchain(db=db2)
-            state_a = chain2._snapshot_memory_state()
+    @unittest.skipIf(
+        os.environ.get("PYTEST_XDIST_WORKER") is not None
+        and "MC_RUN_SLOW" not in os.environ,
+        "50-block fixture exceeds the default 30s xdist timeout; "
+        "runs in CI/serial mode (MC_RUN_SLOW=1) or via -n 0",
+    )
+    def test_zero_drift_at_50_blocks(self):
+        """50 blocks -- enough to cross most periodic-window
+        accumulator boundaries (reward maturation queues, archive
+        epoch closes, attester-coverage rollovers) at typical small
+        window sizes.  Drift here surfaces non-determinism that
+        depends on cumulative count rather than per-block apply.
 
-            ok, reason = chain2._replay_state_from_genesis()
-            self.assertTrue(ok, reason)
-            state_b = chain2._snapshot_memory_state()
-
-            # Phase 3: assert no drift.  Capture the diagnostic
-            # output for the failure message so a fail report names
-            # the drifted field.
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                drift_count = _compare_state_dicts(state_a, state_b)
-            self.assertEqual(
-                drift_count, 0,
-                f"Cold-load vs replay-from-genesis drift detected on "
-                f"a 3-block test fixture.  This is the option (a) "
-                f"determinism bug at its smallest reproducer.  Diff "
-                f"output:\n{buf.getvalue()}",
-            )
-            _close(db2)
+        Build cost: ~30s wall clock due to WOTS+ keygen for 50
+        signatures at tree_height=8.  Default xdist timeout is 30s,
+        so this test is skipped under parallel runs and only fires
+        when MC_RUN_SLOW=1 or under serial (``-n 0``).  The 3- and
+        15-block determinism tests above still run under xdist and
+        catch the common case."""
+        try:
+            self._assert_zero_drift(n_blocks=50)
         finally:
             self._restore_all()
 
