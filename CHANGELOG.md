@@ -4,6 +4,26 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.95.1] — 2026-05-27
+
+Patch on 1.95.0 ``_apply_replay_accumulator_restore`` to cover the
+three accumulator keys whose snapshot key name differs from the
+attribute name (``immature_rewards`` -> ``_immature_rewards``,
+``escrow`` -> ``_escrow``) AND the one that's a scalar projection
+of an object (``bootstrap_ratchet_max`` -> rebuild a RatchetState
+and ``.observe()`` the scalar -- ``max_progress`` is a read-only
+property and direct assignment is rejected at runtime).
+
+The 1.95.0 ``compare-state-paths`` diagnostic on validator-1's
+chain.db dropped drift from 25 -> 5 fields.  The remaining 5:
+``balances`` (state_root input, expected), ``staked`` (state_root
+input, expected), ``immature_rewards``, ``escrow``, and
+``bootstrap_ratchet_max``.  1.95.1 lands the last three.
+
+After 1.95.1: only the two state_root-input fields drift, which is
+by design -- replay rebuilds them from blocks to match what the
+chain's header.state_root committed to.
+
 ## [1.95.0] — 2026-05-27
 
 Generalises the 1.94.0 replay-skip-activations mechanism from "preserve

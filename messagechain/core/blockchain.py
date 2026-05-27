@@ -17132,11 +17132,15 @@ class Blockchain:
                 setattr(self.supply, name, cold_snapshot[name])
 
         # Top-level blockchain accumulators that aren't in supply
-        # but are also non-state_root.  Same explicit listing so
-        # new accumulators raise visibility.
+        # but are also non-state_root.  Listed by their snapshot
+        # KEY (the string used in ``_snapshot_memory_state``); a
+        # separate ``key_to_attr`` map handles the few cases where
+        # the snapshot key differs from the attribute name (e.g.
+        # ``message_counts`` snapshot key vs.
+        # ``entity_message_count`` attribute).
         blockchain_fields_to_restore = (
             "wots_tree_heights",
-            "message_counts",  # entity_message_count
+            "message_counts",  # -> entity_message_count
             "proposer_sig_counts",
             "attestation_sig_counts",
             "slash_sig_counts",
@@ -17144,9 +17148,8 @@ class Blockchain:
             "key_rotation_last_height",
             "key_history",
             "reputation",
-            "_immature_rewards",
-            "_escrow",
-            "_bootstrap_ratchet",
+            "immature_rewards",  # -> _immature_rewards
+            "escrow",            # -> _escrow
             "archive_active_snapshot",
             "validator_archive_misses",
             "validator_first_active_block",
@@ -17157,23 +17160,36 @@ class Blockchain:
             "seed_divestment_debt",
             "receipt_subtree_roots",
             "past_receipt_subtree_roots",
-            "_processed_evidence",
             "blocks_since_last_finalization",
             "finality",
         )
-        # Map ``_snapshot_memory_state`` key -> attribute name.
-        # Most snapshot keys match attribute names directly.  The
-        # exception is ``message_counts`` (snapshot) ->
-        # ``entity_message_count`` (attribute) -- the asymmetry was
-        # already baked into ``_snapshot_memory_state`` /
-        # ``_restore_memory_snapshot``; we just mirror the existing
-        # mapping here.
-        key_to_attr = {"message_counts": "entity_message_count"}
+        # Snapshot key -> attribute name.  Defaults to identity if
+        # not listed.  Mirrors the asymmetries baked into
+        # ``_snapshot_memory_state`` / ``_restore_memory_snapshot``.
+        key_to_attr = {
+            "message_counts": "entity_message_count",
+            "immature_rewards": "_immature_rewards",
+            "escrow": "_escrow",
+        }
         for snap_key in blockchain_fields_to_restore:
             if snap_key not in cold_snapshot:
                 continue
             attr_name = key_to_attr.get(snap_key, snap_key)
             setattr(self, attr_name, cold_snapshot[snap_key])
+
+        # ``bootstrap_ratchet_max`` is a SCALAR projection of the
+        # ``_bootstrap_ratchet`` object (its .max_progress is a
+        # read-only property), not a whole-object field.  Restore
+        # by constructing a fresh RatchetState and ``observe``-ing
+        # the value -- same pattern as ``_restore_memory_snapshot``
+        # at line ~17914.
+        ratchet_value = cold_snapshot.get("bootstrap_ratchet_max", 0.0)
+        if ratchet_value > 0.0:
+            from messagechain.consensus.bootstrap_gradient import (
+                RatchetState,
+            )
+            self._bootstrap_ratchet = RatchetState()
+            self._bootstrap_ratchet.observe(ratchet_value)
 
     def _reset_state(self):
         """Reset in-memory state to genesis defaults for replay.
