@@ -3967,6 +3967,55 @@ assert MARKET_FEE_FLOOR_HEIGHT > GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT, (
 # starts admitting.
 REACT_TX_HEIGHT = 624   # Tier 17 — fast-forwarded for live ReactTx test
 
+
+# ----------------------------------------------------------------
+# Phase 3 hard fork: accumulator commitment in state_root.
+# ----------------------------------------------------------------
+# Pre-1.96.0, ``compute_current_state_root`` committed only to the
+# entity SMT (balances / staked / nonces / public_keys / …) plus
+# the reaction-state contribution post-REACT_TX_HEIGHT.  Every
+# other in-memory accumulator (per-validator counters, reward
+# queues, supply scalars, activation flags, …) lived OUTSIDE
+# state_root and could drift silently between nodes -- the 2026-05
+# v1/v2 divergence chain was exactly this defect class.
+#
+# At and after ``ACCUMULATOR_COMMITMENT_HEIGHT`` the canonical
+# state root mixes in a deterministic SHA-256 of all consensus-
+# affecting accumulators (the exact set is pinned in
+# ``messagechain.consensus.accumulator_commitment._COMMITTED_FIELDS``).
+# Any node whose accumulators differ from peers produces a
+# different state root -> block fails validation immediately ->
+# chain stops.  Drift detected at the source instead of cascading
+# silently for months.
+#
+# Hard fork because the commitment changes block headers'
+# ``state_root`` content.  All validators must be on 1.96.0+ AND
+# must have bit-identical accumulator state at the activation
+# block, or the chain wedges.  Coordinate via:
+#
+#   1. Ship 1.96.0 with this constant set far enough in the future
+#      for operators to upgrade.
+#   2. Splice all validators to identical chain.db right before
+#      activation (operator procedure).
+#   3. Chain crosses activation, commits, locks in identical state
+#      as canonical.
+#
+# Set to a real future height now that the propose-side
+# snapshot-apply-rollback fix has landed -- propose and apply
+# produce matching state_roots post-activation (verified by
+# test_end_to_end_activation_chain_advances).  Activation gives
+# ~2-3 days of runway from the 1.96.0 ship time at the current
+# ~10-min block cadence, which is enough for operator coordination
+# (upgrade both validators well before activation; splice them to
+# bit-identical state shortly before activation to guarantee
+# accumulator-state agreement at the activation block).
+#
+# After activation, ANY drift in any committed accumulator field
+# produces a different state_root and fails consensus on the very
+# next block -- closing the silent-drift surface that produced
+# the 2026-05 v1/v2 cascade.
+ACCUMULATOR_COMMITMENT_HEIGHT = 3000
+
 # ReactTransaction choice byte values (packed into the flags field —
 # see reaction.py).  CLEAR retracts a prior vote; UP and DOWN are the
 # two signed positions.  Numeric values are fixed at the protocol

@@ -4,6 +4,99 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.96.0] — 2026-05-27 — HARD FORK: Accumulator commitment in state_root
+
+The structural fix the entire 1.91-1.95 series was building toward.
+At and after ``ACCUMULATOR_COMMITMENT_HEIGHT = 3000`` the canonical
+state_root mixes in a deterministic SHA-256 of every consensus-
+visible accumulator (per-validator counters, supply scalars,
+activation flags, reward queues, …).  Any node whose accumulators
+differ from peers produces a different state_root → next block
+fails validation → chain stops at the source of the drift instead
+of cascading silently for months.
+
+### Why this is the long-term fix
+
+Pre-1.96.0 ``compute_current_state_root`` committed only to the
+entity SMT (balances / staked / nonces / public_keys / …) and
+the reaction-state contribution post-REACT_TX_HEIGHT.  EVERY
+in-memory accumulator outside that set lived without consensus
+protection.  Drift on those accumulators was invisible to peers
+until the drifted value cascaded into a future block's apply
+path and changed an SMT input -- the exact mechanism behind the
+2026-05 v1/v2 cascade that drove the 1.91-1.95 series.
+
+1.91.0 added cold-load self-heal.  1.92.0 fixed log clarity.
+1.93.0 fixed the replay-from-genesis ``self.height`` ordering bug.
+1.94.0 added replay-skip-activations.  1.95.x preserved all non-
+state_root accumulators across replay.  All of these were
+band-aids on the symptom -- the underlying defect class
+(accumulators outside state_root) remained.
+
+1.96.0 closes the defect class.  At activation, consensus
+enforces accumulator determinism the way it enforces SMT-input
+determinism today.
+
+### Activation procedure (operator)
+
+1. Ship 1.96.0 to GitHub releases (tag, signed).
+2. ``messagechain upgrade --yes`` on validator-1.
+3. Verify v1 healthy and chain advancing.
+4. ``messagechain upgrade --yes`` on validator-2.
+5. Verify both validators on 1.96.0 and chain advancing.
+6. **Before activation height**, splice both validators to
+   bit-identical chain.db (use the SCP-from-v2 procedure
+   established in the 2026-05-26 / 2026-05-27 incidents) to
+   guarantee accumulator-state agreement at the activation block.
+   If any field differs between v1 and v2 at activation, both
+   nodes' computed state_roots diverge and the chain wedges.
+7. Watch chain cross block 3000.  Verify both validators commit
+   the same state_root.
+
+If activation wedges the chain: revert to 1.95.1 binaries on
+both validators (no-op the activation gate via downgrade), splice
+to identical state, re-attempt at a later activation height
+after fixing whatever caused the divergence.
+
+### Added
+
+* **``messagechain/consensus/accumulator_commitment.py``** -- the
+  canonical encoder + commitment computation.  Encoder is
+  recursive, deterministic, order-independent for sets and dicts,
+  and rejects floats (last-bit FPU precision is consensus-
+  hazardous).  Committed-field list is explicit, ordered, pinned
+  in ``_COMMITTED_FIELDS``; adding a field is a hard fork.
+
+* **``compute_post_state_root_for_block`` routes through
+  ``_compute_post_state_root_via_real_apply`` post-activation.**
+  The legacy sim doesn't predict accumulator mutations; the
+  real-apply dry-run actually applies the block in a
+  snapshot/transaction wrapper, captures state_root via
+  ``compute_current_state_root``, rolls back.  Propose-side
+  state_root therefore agrees with validator-side post-apply by
+  construction.  Test: ``test_end_to_end_activation_chain_
+  advances`` builds a chain of 3 blocks all post-activation;
+  every block adds cleanly.
+
+### Out of scope (future hard fork)
+
+The v1 commitment set excludes types whose canonical
+serialization requires more design:
+
+* ``bootstrap_ratchet_max`` (float -- needs quantization to int)
+* ``escrow`` (EscrowLedger custom object -- needs canonical
+  encoder)
+* ``finality`` (FinalityTracker custom object -- needs canonical
+  encoder)
+* ``reaction_state`` (already in state_root via
+  ``state_root_contribution`` post-REACT_TX_HEIGHT; not doubly
+  committed)
+* ``processed_evidence`` (set of variable-shape evidence hashes)
+* ``pending_unstakes`` (dict of complex per-entity unstake records)
+
+These can be added in a future hard fork once their canonical
+forms are specified.
+
 ## [1.95.1] — 2026-05-27
 
 Patch on 1.95.0 ``_apply_replay_accumulator_restore`` to cover the

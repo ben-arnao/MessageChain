@@ -6141,9 +6141,28 @@ class Blockchain:
         self._rebuild_state_tree()
         entity_root = self.state_tree.root()
         if self.height >= REACT_TX_HEIGHT:
-            return _mix_state_roots(
+            entity_root = _mix_state_roots(
                 entity_root,
                 self.reaction_state.state_root_contribution(),
+            )
+        # Phase 3 (1.96.0+) accumulator commitment.  At and after
+        # ACCUMULATOR_COMMITMENT_HEIGHT the canonical state root
+        # mixes in a deterministic hash of every non-state_root
+        # accumulator (per-validator counters, supply scalars,
+        # activation flags, …).  Any drift between two nodes
+        # produces a different state root and fails consensus
+        # immediately -- closing the silent-drift surface that
+        # produced the 2026-05 v1/v2 divergence cascade.  See
+        # messagechain/consensus/accumulator_commitment.py for the
+        # full committed-fields set.
+        from messagechain.config import ACCUMULATOR_COMMITMENT_HEIGHT
+        if self.height >= ACCUMULATOR_COMMITMENT_HEIGHT:
+            from messagechain.consensus.accumulator_commitment import (
+                compute_accumulator_root,
+            )
+            accumulator_root = compute_accumulator_root(self)
+            return _mix_state_roots(
+                entity_root, accumulator_root,
             )
         return entity_root
 
@@ -6184,6 +6203,23 @@ class Blockchain:
         #   * `inclusion_list` is a non-list block attribute (a single
         #      InclusionList | None) — read separately, not from the
         #      registry.
+        # Phase 3 (1.96.0+): post-activation the canonical
+        # state_root mixes in the accumulator commitment.  The
+        # legacy sim path doesn't predict accumulator mutations,
+        # so post-activation we route through a snapshot-apply-
+        # rollback dry-run that produces the SAME state_root the
+        # validator will compute after applying the block live.
+        # Pre-activation we keep the cheaper sim path for
+        # byte-equivalence to historical block round-trips.
+        from messagechain.config import ACCUMULATOR_COMMITMENT_HEIGHT
+        if block.header.block_number >= ACCUMULATOR_COMMITMENT_HEIGHT:
+            return self._compute_post_state_root_via_real_apply(
+                block,
+                proposer_signature_leaf_index=(
+                    proposer_signature_leaf_index
+                ),
+            )
+
         kwargs: dict = {}
         for attr in self._BLOCK_TX_LIST_ATTRS:
             kwargs[attr] = list(getattr(block, attr, None) or [])
@@ -6197,6 +6233,88 @@ class Blockchain:
             inclusion_list=getattr(block, "inclusion_list", None),
             **kwargs,
         )
+
+    def _compute_post_state_root_via_real_apply(
+        self,
+        block,
+        *,
+        proposer_signature_leaf_index: int | None = None,
+    ) -> bytes:
+        """Post-activation propose-side state_root computation:
+        snapshot-apply-rollback dry-run.
+
+        The legacy sim (``compute_post_state_root``) doesn't predict
+        accumulator mutations, so post-ACCUMULATOR_COMMITMENT_HEIGHT
+        it can't produce the state_root the validator computes after
+        ``_apply_block_state`` runs live.  Solution: actually run
+        ``_apply_block_state``, capture the resulting state_root,
+        roll back all mutations.  This guarantees propose-side
+        agrees with validator-side post-apply by construction.
+
+        Surface coercions:
+          * BlockDraft tx-list fields default to ``None``; coerce
+            to empty lists for the apply path.
+          * BlockDraft header is minimal (SimpleNamespace with
+            ``proposer_id`` + ``block_number``); fill missing attrs
+            to None so the apply path's optional-attr guards work.
+          * Predicted ``proposer_signature_leaf_index`` is used to
+            bump the proposer's leaf_watermark in the dry-run
+            (live apply does this from the real sig at the same
+            point; without the bump the dry-run produces a
+            stale watermark and the state_root mismatches).
+
+        Snapshot+rollback discipline: ``_snapshot_memory_state`` /
+        ``_restore_memory_snapshot`` reverts in-memory; chaindb
+        writes are wrapped in ``begin_transaction`` /
+        ``rollback_transaction``.  No mutations escape the dry run.
+        """
+        snapshot = self._snapshot_memory_state()
+        # Normalise tx-list fields: BlockDraft objects passed from
+        # ``propose_block`` use ``None`` for unset tx lists, but
+        # ``_apply_block_state`` and friends expect lists.
+        for attr in self._BLOCK_TX_LIST_ATTRS:
+            if getattr(block, attr, None) is None:
+                setattr(block, attr, [])
+        # Header surface required by ``_apply_block_state``: fill
+        # missing attrs on the draft header to None.
+        for header_attr in (
+            "proposer_signature",
+            "prev_hash",
+            "timestamp",
+            "state_root",
+            "merkle_root",
+            "version",
+        ):
+            if not hasattr(block.header, header_attr):
+                setattr(block.header, header_attr, None)
+        if self.db is not None:
+            self.db.begin_transaction()
+        try:
+            # Apply the block's state mutations.  The live apply
+            # path verifies state_root AFTER _apply_block_state but
+            # BEFORE _process_attestations / _record_stake_snapshot
+            # -- so the canonical state_root reflects post-_apply_
+            # block_state ONLY.  Don't call the post-helpers here.
+            self._apply_block_state(block)
+            # Bump the proposer's leaf_watermark to match what live
+            # apply would do once the real proposer_signature is
+            # attached.  Live apply reads sig.leaf_index from the
+            # signed header; we don't have a real sig yet (we're
+            # dry-running BEFORE the proposer signs) but we DO
+            # have the predicted leaf_index from the caller.
+            # Without this bump the dry-run produces a stale
+            # watermark and the state_root mismatches.
+            if proposer_signature_leaf_index is not None:
+                self._bump_watermark(
+                    block.header.proposer_id,
+                    proposer_signature_leaf_index,
+                )
+            return self.compute_current_state_root()
+        finally:
+            self._restore_memory_snapshot(snapshot)
+            self._rebuild_state_tree()
+            if self.db is not None:
+                self.db.rollback_transaction()
 
     def compute_post_state_root(
         self,
