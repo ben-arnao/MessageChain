@@ -4,6 +4,87 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.97.1] — 2026-05-30 — HOTFIX: cold-load snapshot at commit-point + smart-rewind for legacy chain.db
+
+The deeper architectural issue discovered during the 1.97.0
+deployment attempt to mainnet validators.  Both validators'
+chain.db files were in a state where NO binary (1.96.3 OR
+1.97.0) could cold-load them -- the running daemons stayed
+healthy via warm in-memory state, but ANY restart would fail.
+
+Root cause: pre-1.97.1 ``_persist_state_snapshot`` was called at
+the END of ``_append_block``, AFTER ``_process_attestations``
+had mutated ``reputation`` (in ``_COMMITTED_FIELDS``).  Stored
+snapshots carried POST-intermediate accumulator values while
+``header.state_root`` committed PRE-intermediate values.  Cold-
+load restoring such a snapshot ALWAYS produced a state_root
+that didn't match the header.
+
+### Fixed
+
+* **Apply path: snapshot captured at commit-point, write
+  deferred.**  Split ``_persist_state_snapshot`` into two
+  methods: ``_compute_state_snapshot_blob`` (capture) +
+  ``_write_state_snapshot_blob`` (write).  In
+  ``_append_block``, the blob is captured right after
+  ``compute_current_state_root`` verifies ``header.state_root``
+  (commit-point), then the write is deferred to the existing
+  snapshot-point INSIDE the same db transaction so the block
+  and its snapshot land atomically.  NEW snapshots match
+  ``header.state_root`` by construction.
+
+* **Cold-load: smart integrity check for legacy snapshots.**
+  ``_integrity_check_smart_rewind`` handles EXISTING chain.db
+  files written by pre-1.97.1 daemons (where the stored
+  snapshot is post-intermediate but ``header.state_root`` is
+  pre-intermediate).  Temporarily subtracts tip's
+  ``_process_attestations`` reputation bumps from in-memory
+  state (a deterministic, computable offset: ``-1`` per
+  attestation in the tip block), recomputes ``state_root``,
+  compares to header.  If the rewound value matches, the chain
+  is internally consistent and cold-load accepts.  Restores
+  reputation to its post-intermediate form before returning so
+  the daemon's warm state is canonical for producing
+  subsequent blocks.
+
+  Conservative scope: only rewinds ``reputation`` (the most
+  common case).  ``blocks_since_last_finalization`` is also
+  mutated by ``_process_attestations`` when justification
+  fires, but reversing it requires knowing whether
+  justification fired AND the prior block's value -- skipping
+  it here keeps the check simple at the cost of one failure
+  mode (chain where tip justified AND reputation rewind alone
+  doesn't reconcile; falls through to self-heal).
+
+Why this is the proper long-term fix (Option 2 from the prior
+report): no consensus change, no hard fork, no chain.db schema
+change.  Existing chain.db files cold-load via smart-rewind
+without operator intervention; new snapshots written
+post-upgrade use the direct check.  Purely about WHERE in the
+apply path the snapshot bytes are captured -- the bytes
+themselves commit to identical state as ``header.state_root``
+by construction.
+
+Regression coverage in
+``tests/test_audit_r60_snapshot_commit_point.py``:
+  * ``test_cold_load_post_activation_chain_succeeds`` -- new
+    chain.db built with 1.97.1 cold-loads directly (no rewind
+    needed).
+  * ``test_smart_rewind_recovers_old_format_snapshot`` --
+    simulates a chain.db whose snapshot is in the old
+    (post-intermediate) format; smart-rewind succeeds and warm
+    state remains post-intermediate.
+
+### Operator note
+
+After upgrading to 1.97.1, the upgrade-CLI smoke test against
+the existing post-1.96.x chain.db will pass via smart-rewind
+(a single ``logger.info`` line names which path fired).  After
+the first block apply post-upgrade, the new commit-point
+snapshot format is written and subsequent restarts use the
+direct integrity check.  No splice, no reset, no manual
+intervention.
+
 ## [1.97.0] — 2026-05-30 — three long-term proper fixes from the 2026-05-30 wedge recovery
 
 Lands the three latent-issue fixes the 1.96.x recovery exposed.
