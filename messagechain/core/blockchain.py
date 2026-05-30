@@ -1415,6 +1415,37 @@ class Blockchain:
                 actual_root = self.compute_current_state_root(
                     as_of_block=latest_block.header.block_number,
                 )
+                # Audit r60 latent issue D fix (2026-05-30):
+                # SMART INTEGRITY CHECK for chains whose existing
+                # state_snapshot was written by an older binary
+                # (pre-1.97.1) that captured at SNAPSHOT-POINT
+                # rather than COMMIT-POINT.  ``_process_attestations``
+                # mutates ``reputation`` (in ``_COMMITTED_FIELDS``)
+                # AFTER the apply path's state_root verification, so
+                # an old-format snapshot has post-mutation
+                # reputation values while header.state_root
+                # committed pre-mutation values -- a fixed,
+                # computable offset.  Try reversing that offset and
+                # see if state_root matches; if it does, the chain
+                # is internally consistent and the snapshot is just
+                # in the old format -- accept the cold-load.  If
+                # not, fall through to the existing self-heal path.
+                if actual_root != latest_header_root and (
+                    self._integrity_check_smart_rewind(
+                        latest_block, latest_header_root,
+                    )
+                ):
+                    logger.info(
+                        "Cold-load integrity check passed via "
+                        "smart-rewind at block #%d: snapshot was in "
+                        "old (post-intermediate) format but chain is "
+                        "internally consistent.  After this run's "
+                        "first block apply, the new (commit-point) "
+                        "snapshot format will be written and "
+                        "subsequent restarts use the direct check.",
+                        latest_block.header.block_number,
+                    )
+                    actual_root = latest_header_root  # flag as matched
                 if actual_root != latest_header_root:
                     logger.warning(
                         "Cold-load state_root mismatch at block "
@@ -2635,6 +2666,153 @@ class Blockchain:
         self._snapshot_hmac_secret_cache = secret
         return secret
 
+    def _integrity_check_smart_rewind(
+        self, latest_block, latest_header_root: bytes,
+    ) -> bool:
+        """Audit r60 latent issue D fix (2026-05-30) -- smart
+        integrity check for chains whose existing state_snapshot was
+        written by a pre-1.97.1 binary.
+
+        Pre-1.97.1, ``_persist_state_snapshot`` was called at the END
+        of ``_append_block``, AFTER ``_process_attestations`` had
+        already mutated ``reputation`` (in ``_COMMITTED_FIELDS``).
+        Result: stored snapshots had POST-intermediate accumulator
+        values while ``header.state_root`` committed PRE-intermediate
+        values -- cold-load always failed the integrity check.
+
+        Post-1.97.1, the apply path captures the snapshot at
+        commit-point, so NEW snapshots match header.state_root by
+        construction.  But EXISTING chain.db files written by old
+        daemons still have the bad-format snapshots.
+
+        This smart check temporarily SUBTRACTS tip's
+        ``_process_attestations`` mutations from in-memory state,
+        recomputes state_root, and checks whether the rewound value
+        matches header.  If it does, the chain is internally
+        consistent (just the snapshot capture timing was wrong),
+        and cold-load can proceed.
+
+        Restores in-memory state to its post-intermediate form before
+        returning, so the daemon's warm state is correct for
+        producing subsequent blocks.
+
+        Conservative: only rewinds ``reputation`` (the only field
+        ``_process_attestations`` mutates that's deterministically
+        derivable from the block's attestations).  ``blocks_since_
+        last_finalization`` is also mutated by _process_attestations
+        when justification fires, but reversing it requires knowing
+        whether justification fired AND the prior block's value --
+        skipping it here keeps the check simple at the cost of one
+        failure mode (chain where tip justified AND reputation rewind
+        alone doesn't reconcile; falls through to self-heal).  In
+        practice the reputation rewind usually suffices.
+
+        Returns True if the rewound state_root matches header,
+        False otherwise (caller falls through to self-heal).
+        """
+        # Save current values so we can restore.
+        saved_reputation: dict[bytes, int] = {}
+        # Subtract one reputation bump per attestation in tip.
+        attestations = getattr(latest_block, "attestations", []) or []
+        for att in attestations:
+            vid = att.validator_id
+            cur = self.reputation.get(vid, 0)
+            saved_reputation[vid] = cur
+            new = cur - 1
+            if new <= 0:
+                self.reputation.pop(vid, None)
+            else:
+                self.reputation[vid] = new
+        try:
+            rewound_root = self.compute_current_state_root(
+                as_of_block=latest_block.header.block_number,
+            )
+            matched = (rewound_root == latest_header_root)
+        finally:
+            # Restore to post-intermediate state -- the daemon's warm
+            # state MUST be post-intermediate for canonical apply of
+            # subsequent blocks (peers have post-intermediate state,
+            # so our next mined block must use post-intermediate
+            # values).
+            for vid, original in saved_reputation.items():
+                self.reputation[vid] = original
+        return matched
+
+    def _compute_state_snapshot_blob(self) -> bytes | None:
+        """Serialize current in-memory state to an HMAC-wrapped blob
+        without writing it to chaindb.  Split out from
+        ``_persist_state_snapshot`` so the apply path can CAPTURE
+        the blob at commit-point (when state matches
+        ``header.state_root``) but DEFER the write until snapshot-
+        point (atomic with the rest of the block-apply transaction).
+
+        Mainnet wedge follow-up (2026-05-30 part 4): the snapshot
+        ``_persist_state_snapshot`` used to be called from the END of
+        ``_append_block`` (after ``_process_attestations``), which
+        meant the captured state included reputation bumps + the
+        finality-stall counter reset that ``_process_attestations``
+        applies AFTER the apply path's ``compute_current_state_root``
+        verification.  Cold-load restoring this snapshot ended up
+        with POST-intermediate accumulators, and
+        ``compute_current_state_root`` then produced a state_root
+        that didn't match ``header.state_root`` (which committed
+        PRE-intermediate values).  Result: cold-load integrity check
+        failed -> chain not recoverable on restart.
+
+        By capturing the blob at commit-point (right after
+        ``compute_current_state_root`` confirmed header.state_root
+        matches), the blob commits to the exact state header.state_root
+        committed to.  Cold-load restoring this snapshot gives state
+        matching header -> integrity check passes by construction.
+
+        Returns ``None`` when the underlying DB doesn't support
+        snapshot writes (test stubs without ``set_state_snapshot``).
+        """
+        if self.db is None or not hasattr(self.db, "set_state_snapshot"):
+            return None
+        import pickle
+        snap = self._snapshot_memory_state()
+        pickle_blob = pickle.dumps(
+            snap, protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        secret = self._get_snapshot_hmac_secret()
+        if secret is None:
+            return pickle_blob
+        return _pack_snapshot_blob(pickle_blob, secret)
+
+    def _write_state_snapshot_blob(
+        self, block_number: int, blob: bytes | None,
+    ) -> None:
+        """Write a previously-captured snapshot blob to chaindb.
+        Same opportunistic-prune logic as ``_persist_state_snapshot``.
+
+        Pairs with ``_compute_state_snapshot_blob``.  Callers that
+        want the legacy "capture + write in one call" semantic
+        should use ``_persist_state_snapshot`` instead.
+        """
+        if (
+            blob is None
+            or self.db is None
+            or not hasattr(self.db, "set_state_snapshot")
+        ):
+            return
+        self.db.set_state_snapshot(block_number, blob)
+        # Opportunistic prune every 100 blocks -- same cadence as
+        # the legacy _persist_state_snapshot path, kept here so all
+        # snapshot writes share a single prune trigger.
+        if block_number % 100 == 0:
+            cutoff = block_number - self._SNAPSHOT_RETENTION_BLOCKS
+            if cutoff > 0:
+                try:
+                    self.db.prune_state_snapshots_before(cutoff)
+                except Exception:
+                    logger.exception(
+                        "state-snapshot prune at cutoff %d failed; "
+                        "continuing (rows accumulate but consensus "
+                        "remains safe)",
+                        cutoff,
+                    )
+
     def _persist_state_snapshot(self, block_number: int) -> None:
         """Snapshot-on-apply: serialize the full consensus-critical
         in-memory state and persist to chaindb at ``block_number``.
@@ -2667,66 +2845,14 @@ class Blockchain:
         restart, the latest snapshot row is verified, unpickled, and
         installed via ``_restore_memory_snapshot``.
         """
-        if self.db is None or not hasattr(self.db, "set_state_snapshot"):
-            return
-        # Mainnet wedge follow-up (2026-05-30): a swallowed exception
-        # here was the silent precursor to several mainnet incidents.
-        # If the snapshot write fails (disk full, SQLite locked,
-        # serialization explodes) and we CONTINUE to commit the block
-        # anyway, chain.db ends up with the block + per-table state
-        # but NO snapshot row at that height.  Cold-load then falls
-        # back to legacy field-by-field load (no in-memory
-        # accumulators) -> state_root divergence on next received
-        # block -> the chain wedges in a way no operator can recover
-        # without manual splice surgery.  We saw this exact shape
-        # during the 2026-05-30 v2 splice attempt and during the
-        # v1 disk-full-then-state-drift episode.
-        #
-        # Proper fix: let the exception propagate.  The caller's
-        # try/except in ``_apply_block_state`` will catch it,
-        # rollback the chaindb transaction, and the block is NOT
-        # committed.  The daemon then re-attempts on the next
-        # propose cadence -- by which time the operator may have
-        # freed disk, OR the failure persists and the daemon halts
-        # cleanly with a loud error instead of accumulating silent
-        # state inconsistency.
-        #
-        # "Fail loud, fail safe" beats "log and continue with a
-        # broken invariant" every time on a permanence-first chain.
-        # See CLAUDE.md "honest operators are insured against
-        # accidents" -- the protection only works if the daemon
-        # refuses to commit a known-inconsistent block.
-        import pickle
-        snap = self._snapshot_memory_state()
-        pickle_blob = pickle.dumps(
-            snap, protocol=pickle.HIGHEST_PROTOCOL,
-        )
-        secret = self._get_snapshot_hmac_secret()
-        if secret is None:
-            # Test stub or legacy DB without ``meta`` accessors --
-            # write the raw pickle blob (the load path's HMAC
-            # check will fail and fall back to legacy field-by-
-            # field load, mirroring the cross-version upgrade
-            # path).  Not used on real chaindb: ChainDB has
-            # ``get_meta`` / ``set_meta`` post-1.59.1.
-            blob = pickle_blob
-        else:
-            blob = _pack_snapshot_blob(pickle_blob, secret)
-        self.db.set_state_snapshot(block_number, blob)
-        # Opportunistic prune every 100 blocks -- amortises the DELETE
-        # over ~1 per minute at 600s/block instead of every block.
-        if block_number % 100 == 0:
-            cutoff = block_number - self._SNAPSHOT_RETENTION_BLOCKS
-            if cutoff > 0:
-                try:
-                    self.db.prune_state_snapshots_before(cutoff)
-                except Exception:
-                    logger.exception(
-                        "state-snapshot prune at cutoff %d failed; "
-                        "continuing (rows accumulate but consensus "
-                        "remains safe)",
-                        cutoff,
-                    )
+        # Convenience wrapper: capture-then-write in one call.  Used
+        # by self-heal and any legacy callsite that wants the
+        # pre-1.97.1 semantic.  The apply path (``_append_block``)
+        # SPLITS the capture and the write so the captured state
+        # matches what header.state_root committed to -- see
+        # _compute_state_snapshot_blob's docstring for why.
+        blob = self._compute_state_snapshot_blob()
+        self._write_state_snapshot_blob(block_number, blob)
 
     def _install_state_snapshot(self, snap: dict) -> None:
         """Load a decoded state-snapshot dict into this blockchain.
@@ -16047,6 +16173,24 @@ class Blockchain:
                     self.db.rollback_transaction()
                 return False, "Invalid state_root — state commitment mismatch"
 
+            # Audit r60 latent issue D fix (2026-05-30): CAPTURE the
+            # state-snapshot blob HERE, at commit-point -- the exact
+            # moment header.state_root committed to.  Write happens
+            # later (inside the same db transaction, atomic with the
+            # block-storage writes) but the BYTES are pinned now,
+            # before ``_process_attestations`` mutates ``reputation``
+            # and ``blocks_since_last_finalization`` (both in
+            # ``_COMMITTED_FIELDS``).  Pre-fix the snapshot was
+            # captured AT WRITE TIME (end of block apply, AFTER
+            # _process_attestations), so the stored snapshot had
+            # POST-intermediate accumulator values while header
+            # committed PRE-intermediate -- cold-load restoring the
+            # snapshot then computed a state_root that didn't match
+            # header.state_root, and the chain wedged at any
+            # restart.  See _compute_state_snapshot_blob's docstring
+            # for the full story.
+            pending_snapshot_blob = self._compute_state_snapshot_blob()
+
             # Supply reconciliation (1.50.0 hard fork) — must run
             # AFTER ``_apply_block_state`` returns and BEFORE the
             # conservation check.  Placement rationale: the rebase
@@ -16175,7 +16319,19 @@ class Blockchain:
                 # istic (every 100 blocks) so steady-state disk cost
                 # stays bounded; the latest snapshot plus a wide reorg
                 # window is always retained.
-                self._persist_state_snapshot(block.header.block_number)
+                # WRITE the commit-point snapshot blob that was
+                # CAPTURED earlier (right after compute_current_state_
+                # root verified header.state_root).  The capture vs
+                # write split is what makes cold-load integrity
+                # checks pass on post-activation chains -- see
+                # _compute_state_snapshot_blob's docstring.  The
+                # write happens here, inside the same db
+                # transaction as the chain-table writes, so
+                # commit_transaction() makes the block AND its
+                # snapshot land atomically.
+                self._write_state_snapshot_blob(
+                    block.header.block_number, pending_snapshot_blob,
+                )
                 self.db.commit_transaction()
         except BaseException:
             if self.db is not None:
