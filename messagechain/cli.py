@@ -6424,6 +6424,61 @@ def cmd_status(args):
     else:
         mark(0, "liveness", f"{seconds_since}s since last block")
 
+    # 3c. Disk-space gate (LOCAL invocations only).  Mainnet wedge
+    # follow-up (2026-05-30): validator-1 hit 100% disk during the
+    # 1.96.3 splice and silently dropped state writes (the daemon's
+    # try/except blocks swallowed the IO errors and continued
+    # running with stale in-memory state -- which then diverged
+    # from any other node's view).  Surfacing disk pressure in
+    # ``status`` gives an operator the warning shot they currently
+    # don't get until the daemon is already failing to commit.
+    #
+    # Only runs against 127.0.0.1 because we need filesystem
+    # access to the data_dir.  A remote --server poll has no way
+    # to introspect the target host's mount point and silently
+    # skipping is the right call.
+    if host in ("127.0.0.1", "localhost", "::1"):
+        try:
+            import shutil as _shutil_disk
+            # Prefer onboard.toml's data_dir; fall back to the
+            # POSIX-default mainnet path; fall back to "." if even
+            # that doesn't exist.  Whatever we end up checking, log
+            # the resolved path in the detail so an operator knows
+            # which mount we measured.
+            try:
+                from messagechain.runtime import onboarding as _ob_d
+                _ob_cfg = _ob_d.read_onboard_config() or {}
+                data_dir = _ob_cfg.get("data_dir") or "/var/lib/messagechain"
+            except Exception:
+                data_dir = "/var/lib/messagechain"
+            if not os.path.exists(data_dir):
+                data_dir = "."
+            usage = _shutil_disk.disk_usage(data_dir)
+            free_gb = usage.free / (1024 ** 3)
+            free_pct = (usage.free / usage.total) * 100 if usage.total else 0
+            # Three tiers: < 5% OR < 500 MB = FAIL (writes failing
+            # imminent); < 20% = WARN (plan capacity before next
+            # release); else OK.  The absolute floor of 500 MB
+            # catches small mount points where 5% would still be
+            # vanishingly small in real terms.
+            disk_detail = (
+                f"{free_gb:.1f} GB free ({free_pct:.0f}%) on {data_dir}"
+            )
+            if usage.free < 500 * 1024 * 1024 or free_pct < 5:
+                mark(2, "disk", f"CRITICAL", disk_detail
+                     + " -- daemon writes about to fail; clean /tmp + "
+                       "prune old .bak-* dirs IMMEDIATELY")
+            elif free_pct < 20:
+                mark(1, "disk", "low", disk_detail
+                     + " -- plan capacity before next release")
+            else:
+                mark(0, "disk", "ok", disk_detail)
+        except Exception as e:
+            # Best-effort: don't let a disk-check failure derail
+            # the broader status report.  WARN so the operator
+            # sees that the check didn't run.
+            mark(1, "disk", "check failed", str(e))
+
     # 4. Validator entity-specific checks (optional)
     if args.entity:
         # Accept hex or address format
@@ -8777,6 +8832,51 @@ def _upgrade_gc_old_backups(install_dir: str, keep: int) -> list:
     return removed
 
 
+def _upgrade_sweep_stale_clones(
+    older_than_seconds: int = 3600,
+) -> list[str]:
+    """Sweep ``/tmp/mc-release-*`` clone dirs older than
+    ``older_than_seconds`` left behind by prior upgrade runs.
+
+    Mainnet wedge follow-up (2026-05-30): the upgrade CLI's clone
+    dir was previously NOT cleaned up on success paths, and several
+    failure paths missed it too.  Validator-1 had accumulated 7
+    stale ``mc-release-*`` dirs (~125 MB) by the time disk hit
+    100% during the 1.96.3 splice -- which then masked the real
+    state-snapshot persistence bug behind a disk-full smokescreen.
+
+    The fix here is preventive: sweep on every upgrade invocation
+    so the next disk-full incident has 125 MB more headroom AND
+    operators don't have to remember to clean /tmp manually.  Run
+    BEFORE clone so we don't sweep our own (just-created) clone
+    dir.  Older-than gate is a safety belt: another upgrade
+    process running concurrently with this one (e.g. weekly timer
+    + manual invocation that beat the lock check) won't have its
+    fresh clone deleted out from under it.
+    """
+    import glob as _glob
+    import shutil as _shutil
+    import time as _time
+
+    removed: list[str] = []
+    now = _time.time()
+    for path in _glob.glob("/tmp/mc-release-*"):
+        try:
+            if not os.path.isdir(path):
+                continue
+            mtime = os.path.getmtime(path)
+            if now - mtime < older_than_seconds:
+                continue
+            _shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                removed.append(path)
+        except Exception:
+            # Best-effort -- a permission error or race with another
+            # process is not worth aborting the upgrade for.
+            continue
+    return removed
+
+
 def cmd_upgrade(args):
     """Run the full validator binary-upgrade flow.
 
@@ -8887,9 +8987,46 @@ def cmd_upgrade(args):
             _say("Aborted by operator.")
             return
 
+    # Sweep stale clone dirs from prior upgrade runs.  Bounded
+    # cost: scans /tmp/mc-release-* (small N), skips fresh ones.
+    _stale = _upgrade_sweep_stale_clones()
+    if _stale:
+        _say(
+            f"Swept {len(_stale)} stale clone dir(s) from prior "
+            f"upgrade runs: "
+            + ", ".join(os.path.basename(p) for p in _stale)
+        )
+
     ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_dir = f"{args.install_dir}.bak-{ts}"
     clone_dir = f"/tmp/mc-release-{ts}"
+
+    # Mainnet wedge follow-up (2026-05-30): register an atexit
+    # handler so the clone dir is removed on EVERY exit path --
+    # successful upgrade, _fail() -> sys.exit(), unexpected
+    # exception, KeyboardInterrupt.  Pre-fix, the success path
+    # never cleaned up the clone (because copytree COPIED it into
+    # install_dir, leaving the source dir intact) and several
+    # failure paths missed it too.  Stale clones accumulated in
+    # /tmp until disk pressure surfaced as a different bug
+    # (validator-1 had 7 stale clones x ~18 MB = ~125 MB by the
+    # time disk hit 100% during the 1.96.3 splice attempt).
+    #
+    # atexit fires at process exit, which is after this function
+    # returns -- by then clone_dir is no longer needed.  Failure
+    # paths inside the function may still try inline rmtree calls;
+    # those are now redundant but harmless (atexit's rmtree with
+    # ignore_errors=True is idempotent against an already-deleted
+    # path).
+    import atexit as _atexit
+
+    def _cleanup_clone_dir() -> None:
+        try:
+            if os.path.exists(clone_dir):
+                shutil.rmtree(clone_dir, ignore_errors=True)
+        except Exception:
+            pass
+    _atexit.register(_cleanup_clone_dir)
 
     # --- Fetch tag (service still running) ---
     # Ordering: clone + verify BEFORE stopping the service or moving

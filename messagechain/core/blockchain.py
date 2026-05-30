@@ -2669,31 +2669,50 @@ class Blockchain:
         """
         if self.db is None or not hasattr(self.db, "set_state_snapshot"):
             return
-        try:
-            import pickle
-            snap = self._snapshot_memory_state()
-            pickle_blob = pickle.dumps(
-                snap, protocol=pickle.HIGHEST_PROTOCOL,
-            )
-            secret = self._get_snapshot_hmac_secret()
-            if secret is None:
-                # Test stub or legacy DB without ``meta`` accessors --
-                # write the raw pickle blob (the load path's HMAC
-                # check will fail and fall back to legacy field-by-
-                # field load, mirroring the cross-version upgrade
-                # path).  Not used on real chaindb: ChainDB has
-                # ``get_meta`` / ``set_meta`` post-1.59.1.
-                blob = pickle_blob
-            else:
-                blob = _pack_snapshot_blob(pickle_blob, secret)
-            self.db.set_state_snapshot(block_number, blob)
-        except Exception:
-            logger.exception(
-                "snapshot-on-apply failed at block #%d; cold restart "
-                "may need to fall back to legacy field-by-field load",
-                block_number,
-            )
-            return
+        # Mainnet wedge follow-up (2026-05-30): a swallowed exception
+        # here was the silent precursor to several mainnet incidents.
+        # If the snapshot write fails (disk full, SQLite locked,
+        # serialization explodes) and we CONTINUE to commit the block
+        # anyway, chain.db ends up with the block + per-table state
+        # but NO snapshot row at that height.  Cold-load then falls
+        # back to legacy field-by-field load (no in-memory
+        # accumulators) -> state_root divergence on next received
+        # block -> the chain wedges in a way no operator can recover
+        # without manual splice surgery.  We saw this exact shape
+        # during the 2026-05-30 v2 splice attempt and during the
+        # v1 disk-full-then-state-drift episode.
+        #
+        # Proper fix: let the exception propagate.  The caller's
+        # try/except in ``_apply_block_state`` will catch it,
+        # rollback the chaindb transaction, and the block is NOT
+        # committed.  The daemon then re-attempts on the next
+        # propose cadence -- by which time the operator may have
+        # freed disk, OR the failure persists and the daemon halts
+        # cleanly with a loud error instead of accumulating silent
+        # state inconsistency.
+        #
+        # "Fail loud, fail safe" beats "log and continue with a
+        # broken invariant" every time on a permanence-first chain.
+        # See CLAUDE.md "honest operators are insured against
+        # accidents" -- the protection only works if the daemon
+        # refuses to commit a known-inconsistent block.
+        import pickle
+        snap = self._snapshot_memory_state()
+        pickle_blob = pickle.dumps(
+            snap, protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        secret = self._get_snapshot_hmac_secret()
+        if secret is None:
+            # Test stub or legacy DB without ``meta`` accessors --
+            # write the raw pickle blob (the load path's HMAC
+            # check will fail and fall back to legacy field-by-
+            # field load, mirroring the cross-version upgrade
+            # path).  Not used on real chaindb: ChainDB has
+            # ``get_meta`` / ``set_meta`` post-1.59.1.
+            blob = pickle_blob
+        else:
+            blob = _pack_snapshot_blob(pickle_blob, secret)
+        self.db.set_state_snapshot(block_number, blob)
         # Opportunistic prune every 100 blocks -- amortises the DELETE
         # over ~1 per minute at 600s/block instead of every block.
         if block_number % 100 == 0:
@@ -16161,6 +16180,63 @@ class Blockchain:
         except BaseException:
             if self.db is not None:
                 self.db.rollback_transaction()
+            # Mainnet wedge follow-up (2026-05-30): the chaindb
+            # rollback above unwinds the db transaction, but
+            # ``chain.append`` + the in-memory mutations from
+            # ``_apply_block_state`` + ``_record_stake_snapshot``
+            # + fork_choice updates have ALREADY landed in memory
+            # by the time a late-stage exception (e.g.,
+            # ``_persist_state_snapshot`` IO failure) fires.
+            # Without rolling those back, the daemon's view
+            # diverges from chain.db immediately and EVERY
+            # subsequent block apply builds on a phantom state.
+            #
+            # The pre-2026-05-30 behavior masked this because
+            # ``_persist_state_snapshot`` swallowed its own
+            # exceptions silently -- chain.db ended up missing
+            # the snapshot row but the rest of the apply path
+            # succeeded.  Now that we propagate, we MUST also
+            # restore the in-memory state to its pre-apply
+            # baseline so the running daemon stays consistent.
+            #
+            # Restoration mirrors the in-band state_root-mismatch
+            # branch above (line ~16043) plus a chain-tip pop,
+            # since we're past chain.append by the time this
+            # except branch fires.
+            try:
+                # Pop the appended block (if it landed before the
+                # exception).  Guard against the case where the
+                # exception fired BEFORE chain.append -- in that
+                # path self.chain[-1] is the previous tip.
+                if (
+                    len(self.chain) > 0
+                    and self.chain[-1].block_hash == block.block_hash
+                ):
+                    self.chain.pop()
+                    self._block_by_hash.pop(block.block_hash, None)
+                    # Restore the fork-choice tip the apply path
+                    # removed when adding the new block.  Without
+                    # this, the next propose attempt picks a
+                    # phantom parent that isn't on any chain.
+                    if hasattr(self, "fork_choice"):
+                        try:
+                            self.fork_choice.remove_tip(block.block_hash)
+                        except Exception:
+                            pass
+                # Restore in-memory state from the pre-apply
+                # snapshot.  This reverts every per-entity dict,
+                # every accumulator, the supply scalars, etc.
+                # back to the post-prev-block view.
+                self._restore_memory_snapshot(snapshot)
+                self._rebuild_state_tree()
+            except Exception:
+                # Best-effort rollback.  If memory restore itself
+                # fails, the original exception is still
+                # propagated (it's what the operator needs to
+                # see) and the daemon will exit / restart on the
+                # next caller; cold-load from chain.db (which
+                # WAS rolled back) gives a clean baseline.
+                pass
             raise
 
         # Process any orphan blocks that depend on this block
