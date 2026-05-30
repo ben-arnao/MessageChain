@@ -4,6 +4,78 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.96.1] — 2026-05-30
+
+Audit r60 ships the top-2 findings (the #1 structural inclusion-
+list-non-publication evidence is deferred to a dedicated session,
+per the audit offer's caveat about hard-fork-required structural
+work).  No consensus changes; both items target DoS resistance and
+operator-recovery ergonomics on a populated mainnet.
+
+### Fixed
+
+* **``verify_signature`` now consults the previously-dead
+  ``SignatureCache`` (audit r60 #2).**  Pre-fix:
+  ``messagechain/crypto/sig_cache.py`` defined a Bitcoin-Core-style
+  positive cache, ``Blockchain.__init__`` allocated the global
+  cache, and two ``invalidate()`` calls fired on reorg -- but no
+  code path ever called ``lookup()`` or ``store()``.  Every WOTS+
+  verify (~67 hash-chain walks × ~67 SHA3 ops each = ~4500 hash
+  ops) ran end-to-end at mempool admission, block validation,
+  reorg replay, AND ``EquivocationWatcher`` observation -- re-
+  verifying identical ``(msg_hash, sig, root_pk)`` triples every
+  layer.  This is DoS amplification against the primary anchored
+  adversary (validator collusion): a coordinated peer flood of
+  replayed valid-but-already-seen txs makes honest validators
+  burn CPU re-verifying the same signatures, raising the cost of
+  being honest and lowering the cost of slow-block censorship.
+  Fix routes ``lookup()`` / ``store()`` through the SINGLE
+  ``verify_signature`` chokepoint in ``crypto/keys.py``, so every
+  caller (mempool, block apply, equivocation watcher, NRE,
+  BogusRejection, IL verifier) benefits without per-site edits
+  AND the existing ``Blockchain.sig_cache.invalidate()`` calls
+  become meaningful again.  Only positive results cached
+  (negative caching would let transient verifier disagreement
+  become permanent until eviction).  Cache key is
+  ``(msg_hash, sha(sig.to_bytes()), root_pk)`` so two equal
+  ``Signature`` objects produce the same cache key regardless of
+  in-memory identity.  Regression coverage in
+  ``tests/test_audit_r60_sig_cache_wired.py``.  (`4b8617a`)
+
+* **``messagechain upgrade`` health-check timeout now scales
+  with chain height + accepts ``--health-timeout`` override
+  (audit r60 #3).**  Pre-fix: ``_upgrade_health_check`` was
+  called with hardcoded 60s primary + 10s post-rollback confirm
+  budgets, hardcoded at TWO separate callsites in
+  ``cmd_upgrade``.  WAL recovery + replay of recent blocks on a
+  populated mainnet ``chain.db`` routinely takes longer than 60s
+  on commodity validator hardware -- the daemon legitimately
+  needs that time before exposing RPC after restart -- and the
+  hardcoded budget silently fires a rollback on the slow path.
+  Operational risk: on a consensus-affecting release, the
+  ``messagechain-upgrade.timer`` weekly path silently downgrades
+  one validator across the activation height while the other
+  promotes.  Chain forks with no operator-visible signal until
+  the wedge.  CLAUDE.md "honest operators insured against
+  accidents" anchor at the operations layer.  Fix routes BOTH
+  budgets through a single ``_resolve_upgrade_health_budget``
+  resolver: (a) ``--health-timeout`` CLI override wins outright
+  (skips the RPC query entirely, so a deliberately-set value
+  survives even when the daemon's RPC is wedged); (b) otherwise
+  queries the live daemon's RPC pre-stop for ``tip_height`` and
+  scales ``max(60, 60 + tip_height // 1000)`` -- populated
+  mainnet at tip ~3000 gets ~63s, at tip ~50_000 gets ~110s, at
+  tip ~500_000 gets ~560s; (c) RPC unreachable -> legacy 60s
+  fallback.  Rollback-confirm budget tied to primary at 1/6
+  ratio (floor 10s) so the post-rollback "is the old binary
+  healthy?" poll scales with the host's recovery cost too -- not
+  as a parallel hardcoded constant that could drift again.
+  Polling log surfaces both the resolved budget AND its source
+  (``auto(h=N)`` / ``override`` / ``fallback``) so operators
+  reading the journal can tell which path fired without grep'ing
+  the code.  Regression coverage in
+  ``tests/test_audit_r60_upgrade_health_timeout.py``.  (`e9ba631`)
+
 ## [1.96.0] — 2026-05-27 — HARD FORK: Accumulator commitment in state_root
 
 The structural fix the entire 1.91-1.95 series was building toward.
