@@ -4,6 +4,61 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.96.3] — 2026-05-30 — HOTFIX: cold-load gate off-by-one at activation boundary
+
+Second mainnet-wedge fix, surfaced by 1.96.2's smoke test against
+the live h=2999 chain.db.  1.96.2 fixed the propose-side wedge
+(BlockDraft.block_hash missing in dry-run), but its smoke test
+revealed a separate latent bug that prevented any cold-load on a
+chain whose tip lies on the ``activation_height - 1`` boundary.
+
+### Fixed
+
+* **``compute_current_state_root`` accepts ``as_of_block`` to pin
+  the activation-height gate.**  The gate was off-by-one between
+  apply-time and cold-load:
+
+    - At apply-time of block #N (block not yet appended):
+      ``self.height == N`` → gate fires at ``N >= ACTIVATION``,
+      correct for block #N's commit.
+    - At cold-load with chain.db containing blocks 0..N (already
+      appended): ``self.height == N + 1`` → gate fires ONE BLOCK
+      EARLIER than it should when verifying block #N's stored
+      header.state_root.
+
+  Mainnet smoke-test repro on h=2999: ``self.height`` becomes
+  3000 after cold-load, gate fires (3000 >= 3000), INCLUDES the
+  accumulator commitment in the computed root, but block #2999's
+  header committed WITHOUT it (block_number=2999 < 3000) -- the
+  integrity check raises ``ChainIntegrityError`` ("Cold-load
+  self-heal completed but state_root still mismatches").  Pure
+  off-by-one with no underlying state drift.
+
+  Fix: ``compute_current_state_root(as_of_block=N)`` pins the
+  gate to ``N``.  The cold-load integrity check + post-self-heal
+  verification both pass ``latest_block.header.block_number``,
+  matching the apply-time gate decision that minted this header.
+  Apply-time and propose-time callsites keep the default
+  (``self.height``) because at those points ``self.height ==
+  block_number being committed`` -- byte-for-byte historical
+  replay preserved.
+
+  The same gate-height applies to both ``REACT_TX_HEIGHT`` and
+  ``ACCUMULATOR_COMMITMENT_HEIGHT`` checks inside the function,
+  so any future Tier activation that adds its own gate inherits
+  the correct semantic for free.
+
+  Regression coverage in
+  ``tests/test_audit_r60_cold_load_gate_off_by_one.py``.  (`fe3c5b4`)
+
+### Operator note
+
+After upgrading to 1.96.3, the upgrade smoke test will succeed
+against the existing h=2999 chain.db (no splice required, no
+genesis reset, no state surgery).  The cold-load + integrity
+check + 1.96.2's propose-side fix together unwedge the chain.
+Validators resume mining h=3000+ on next restart.
+
 ## [1.96.2] — 2026-05-30 — HOTFIX: mainnet wedge at h=3000
 
 Critical hotfix to unwedge mainnet.  Both validators have been
