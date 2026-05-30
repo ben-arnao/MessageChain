@@ -4,6 +4,82 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.97.0] — 2026-05-30 — three long-term proper fixes from the 2026-05-30 wedge recovery
+
+Lands the three latent-issue fixes the 1.96.x recovery exposed.
+The chain is already healthy on 1.96.3; this release closes the
+defect classes those fixes were band-aids around, so the next
+mainnet incident has fewer footguns to step on.
+
+### Fixed
+
+* **``_persist_state_snapshot`` IO failures now propagate, AND
+  the apply path rolls back the in-memory chain.append + state
+  mutations on any late-stage exception.**  Pre-fix, the
+  function caught ``Exception`` and returned silently -- chain.db
+  got the block + state tables but NO snapshot row.  Cold-load
+  then fell back to legacy field-by-field rehydration (no
+  in-memory accumulators) and the next received block produced
+  a state_root that didn't match anyone else's -> chain wedged
+  with no operator recovery without manual splice.  Exactly the
+  shape the 2026-05-30 v2 splice attempt hit ("no state-snapshot
+  row at block #3000 -- using legacy field-by-field load").
+  Post-fix: snapshot exceptions propagate through the apply
+  path's ``except BaseException`` wrapper, which now also pops
+  the appended block from self.chain, restores in-memory state
+  from the pre-apply snapshot, removes the phantom fork_choice
+  tip, and rebuilds the state tree.  Net effect: a failed apply
+  leaves the daemon in the EXACT pre-apply state -- no silent
+  drift, no partial commits, retry on next propose cadence.
+  (audit r60 latent issue A; ``ee6e19e``)
+
+* **``messagechain upgrade`` cleans up its clone dir on every
+  exit path AND sweeps stale clones from prior runs.**  Pre-fix,
+  the success path simply ``copytree``'d the clone into
+  install_dir and left ``/tmp/mc-release-<ts>`` behind forever;
+  some failure paths missed the inline rmtree too.  Validator-1
+  had accumulated 7 stale clone dirs (~125 MB) over months,
+  which masked the underlying snapshot-persistence bug behind a
+  disk-full smokescreen during the 1.96.3 splice (by the time
+  the operator noticed, /tmp was 4.3 GB and disk was 100%).
+  Post-fix: ``_upgrade_sweep_stale_clones`` (1-hour age gate so
+  a concurrent upgrade's in-flight clone isn't swept) runs at
+  the top of every invocation; an ``atexit`` handler removes
+  this run's clone on every exit path (success, _fail() ->
+  sys.exit, unexpected exception, KeyboardInterrupt).  Idempotent
+  against an already-deleted path.  (audit r60 latent issue B;
+  ``ee6e19e``)
+
+* **``messagechain status`` surfaces disk-space pressure when
+  invoked locally.**  Pre-fix, the first signal that disk was
+  full was the daemon throwing
+  ``OperationalError: database or disk is full`` during active
+  block apply -- by which point silent state drift had already
+  begun.  Post-fix: three tiers in status output:
+
+  - ``< 5%`` free OR ``< 500 MB`` free → ``[FAIL] disk: CRITICAL
+    ... daemon writes about to fail; clean /tmp + prune old
+    .bak-* dirs IMMEDIATELY``
+  - ``5%-20%`` free → ``[WARN] disk: low ... plan capacity
+    before next release``
+  - else → ``[OK] disk: ok``
+
+  Disk path resolved from onboard.toml's ``data_dir``, falling
+  back to ``/var/lib/messagechain``.  Remote ``--server``
+  invocations skip the check (no filesystem access to target
+  host).  (audit r60 latent issue C; ``ee6e19e``)
+
+### Operator note
+
+1.97.0 is purely additive on top of 1.96.3.  No consensus
+changes; no chain.db schema changes; no activation heights.
+After upgrade, ``messagechain status`` gains a "disk:" line and
+``messagechain upgrade`` runs the new clone sweep -- both
+visible immediately.  The snapshot-write-failure rollback path
+is dormant until the next disk-full or IO-pressure event, at
+which point it fails loud + safe instead of accumulating silent
+state drift.
+
 ## [1.96.3] — 2026-05-30 — HOTFIX: cold-load gate off-by-one at activation boundary
 
 Second mainnet-wedge fix, surfaced by 1.96.2's smoke test against
