@@ -1528,6 +1528,19 @@ def build_parser() -> argparse.ArgumentParser:
              "use when recovering from a stale lock file or running "
              "in a container where /run/ is not writable.",
     )
+    upgrade.add_argument(
+        "--health-timeout", type=int, default=None,
+        help="Seconds to wait for the post-restart RPC health check "
+             "before considering the upgrade failed (rollback fires "
+             "after this).  Omit to auto-derive from chain height: "
+             "max(60, 60 + tip_height // 1000) -- a populated mainnet "
+             "DB legitimately takes longer than 60s to expose RPC "
+             "after restart (WAL recovery + recent-block replay on "
+             "commodity hardware), and a hard rollback in that window "
+             "silently reverts one validator across a consensus-"
+             "affecting release.  Override only when you know the "
+             "host's recovery cost.  Audit r60 #3.",
+    )
 
     # --- init ---
     init_p = sub.add_parser(
@@ -8602,6 +8615,54 @@ def _upgrade_tag_to_version(tag: str) -> str:
     return v
 
 
+def _resolve_upgrade_health_budget(
+    host: str, port: int, override: int | None,
+) -> tuple[int, int, str]:
+    """Compute the health-check timeout for an upgrade run.
+
+    Returns ``(primary_s, rollback_confirm_s, resolved_via)``.
+
+    Pre-r60 the budget was hardcoded at 60 s primary + 10 s rollback
+    confirm.  WAL recovery + replay of recent blocks on a populated
+    mainnet chain.db routinely takes longer than 60 s on commodity
+    hardware -- the daemon legitimately needs that time before
+    exposing RPC -- and the hardcoded budget silently fires a
+    rollback on the slow path.  On a consensus-affecting release,
+    that means one validator promotes while the other reverts to
+    the prior binary across the hard-fork height, forking the
+    chain without an operator-visible signal until the wedge.
+
+    Resolution order (mirrors the auth-token resolution shape):
+      1. ``override`` (CLI ``--health-timeout``) wins outright.
+      2. Otherwise query the live daemon's RPC for ``tip_height``
+         and scale: ``max(60, 60 + tip_height // 1000)``.  The
+         daemon is still up at this point (we query BEFORE stopping
+         the service), so this is a free piece of information.
+      3. If the RPC query fails (daemon already wedged, network
+         blip, etc.), fall back to the legacy 60 s.  An upgrade
+         where the daemon isn't reachable pre-stop is a deeper
+         problem than budget scaling can solve.
+
+    The rollback-confirm budget mirrors the primary at a 1/6 ratio
+    (capped to >=10 s) so the post-rollback "is the old binary
+    healthy?" poll scales with the host's recovery cost too.
+    """
+    if override is not None:
+        primary = max(1, int(override))
+        return primary, max(10, primary // 6), "override"
+    try:
+        from client import rpc_call as _rpc
+        resp = _rpc(host, port, "get_chain_info", {})
+        info = resp.get("result") if resp.get("ok") else None
+        if info is not None:
+            tip_height = int(info.get("tip_height", 0))
+            primary = max(60, 60 + tip_height // 1000)
+            return primary, max(10, primary // 6), f"auto(h={tip_height})"
+    except Exception:
+        pass
+    return 60, 10, "fallback"
+
+
 def _upgrade_health_check(host: str, port: int, timeout_s: int = 60) -> bool:
     """Poll local RPC for GREEN.  Returns True on first healthy
     response, False after *timeout_s* seconds without one.
@@ -9092,19 +9153,26 @@ def cmd_upgrade(args):
         _fail(f"systemctl start failed: {e}; backup restored.")
 
     # --- Health check ---
+    primary_budget_s, rollback_budget_s, resolved_via = (
+        _resolve_upgrade_health_budget(
+            args.rpc_host, args.rpc_port,
+            getattr(args, "health_timeout", None),
+        )
+    )
     _say(
-        f"Polling RPC {args.rpc_host}:{args.rpc_port} for up to 60s..."
+        f"Polling RPC {args.rpc_host}:{args.rpc_port} for up to "
+        f"{primary_budget_s}s ({resolved_via})..."
     )
     healthy = _upgrade_health_check(
-        args.rpc_host, args.rpc_port, timeout_s=60,
+        args.rpc_host, args.rpc_port, timeout_s=primary_budget_s,
     )
     if not healthy:
         if args.no_rollback:
             _fail(
-                "health check failed after 60s, but --no-rollback is "
-                f"set. New code left in place. To revert by hand: "
-                f"systemctl stop {args.service} && rm -rf "
-                f"{args.install_dir} && mv {backup_dir} "
+                f"health check failed after {primary_budget_s}s, but "
+                "--no-rollback is set. New code left in place. To "
+                f"revert by hand: systemctl stop {args.service} && "
+                f"rm -rf {args.install_dir} && mv {backup_dir} "
                 f"{args.install_dir} && systemctl start {args.service}",
             )
         _say("Health check FAILED. Rolling back to backup...")
@@ -9125,9 +9193,11 @@ def cmd_upgrade(args):
         subprocess.run(
             ["systemctl", "start", args.service], check=False,
         )
-        # Short confirmation poll after rollback (10s).
+        # Confirmation poll after rollback -- same resolution
+        # source as the primary budget so a populated mainnet DB
+        # gets matching slack on the backup-restart path too.
         if _upgrade_health_check(
-            args.rpc_host, args.rpc_port, timeout_s=10,
+            args.rpc_host, args.rpc_port, timeout_s=rollback_budget_s,
         ):
             _say(f"Rolled back to backup at {backup_dir}.")
             _fail("upgrade failed; rollback succeeded.")
