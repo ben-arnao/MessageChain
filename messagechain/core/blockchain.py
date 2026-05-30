@@ -1402,7 +1402,19 @@ class Blockchain:
             latest_block = self.chain[-1]
             latest_header_root = latest_block.header.state_root
             if latest_header_root and latest_header_root != b"\x00" * 32:
-                actual_root = self.compute_current_state_root()
+                # Audit r60 cold-load gate fix (2026-05-30): pin the
+                # activation-height gate inside compute_current_state_root
+                # to the latest block's block_number, NOT self.height.
+                # self.height = len(self.chain) one-past the latest
+                # block's number; passing block_number directly matches
+                # the apply-time gate decision that minted this header,
+                # so the check fires ONLY on real drift -- not on the
+                # off-by-one phantom mismatch that wedged mainnet's
+                # cold-load at h=3000 (chain tip = #2999, self.height
+                # = 3000, gate would trip prematurely).
+                actual_root = self.compute_current_state_root(
+                    as_of_block=latest_block.header.block_number,
+                )
                 if actual_root != latest_header_root:
                     logger.warning(
                         "Cold-load state_root mismatch at block "
@@ -1428,7 +1440,16 @@ class Blockchain:
                             f"recovery: splice a healthy chain.db "
                             f"from a peer."
                         )
-                    healed_root = self.compute_current_state_root()
+                    # Same as_of_block pin as the pre-self-heal
+                    # check above -- the gate must match the height
+                    # at which latest_block.header.state_root was
+                    # minted, not self.height.  Without this the
+                    # self-heal verifier produces a "post-self-heal
+                    # mismatch" false-positive on a chain whose tip
+                    # lies just before an activation-height boundary.
+                    healed_root = self.compute_current_state_root(
+                        as_of_block=latest_block.header.block_number,
+                    )
                     if healed_root != latest_header_root:
                         raise ChainIntegrityError(
                             f"Cold-load self-heal completed but "
@@ -6112,7 +6133,9 @@ class Blockchain:
                 last_active_height=self.supply.last_active_heights.get(eid, 0),
             )
 
-    def compute_current_state_root(self) -> bytes:
+    def compute_current_state_root(
+        self, *, as_of_block: int | None = None,
+    ) -> bytes:
         """Return the Merkle commitment to the current account state.
 
         Resyncs the SparseMerkleTree with the live balance/nonce/stake
@@ -6137,10 +6160,47 @@ class Blockchain:
         components live in the same hard-fork-gated commitment so a
         light client with a single state-root proof verifies both the
         per-account state AND any reaction-state value with one anchor.
+
+        Audit r60 cold-load gate fix (2026-05-30): ``as_of_block``
+        lets the caller pin the activation-height gate to a specific
+        block_number rather than ``self.height``.  Required because
+        ``self.height = len(self.chain)`` has TWO different meanings:
+
+          * At apply-time of block #N (block not yet appended):
+            ``self.height == N`` → gate fires at ``N >= ACTIVATION``,
+            which is the correct decision for block #N's commit.
+          * At cold-load with chain.db containing blocks 0..N (block
+            already appended): ``self.height == N + 1`` → gate fires
+            one block EARLIER than it should when verifying block
+            #N's stored header.state_root, producing a phantom
+            mismatch on any chain whose tip lies on the
+            "activation_height - 1" block.
+
+        Mainnet hit this at the wedge: chain.db has blocks 0..2999
+        (tip = #2999, pre-activation), ``self.height == 3000``,
+        cold-load's gate fires (3000 >= 3000) and includes the
+        accumulator commitment in the computed root while block
+        #2999's header committed WITHOUT the commitment.  Apparent
+        state_root divergence with no underlying state drift.
+
+        With ``as_of_block=latest_block.header.block_number`` passed
+        from the cold-load integrity check, the gate matches the
+        block-mint-time decision: ``2999 < 3000`` → no commitment →
+        computed root matches header.  The check then catches REAL
+        drift (apply-path bugs, snapshot poisoning) rather than
+        firing on a false positive caused by the off-by-one.
         """
         self._rebuild_state_tree()
         entity_root = self.state_tree.root()
-        if self.height >= REACT_TX_HEIGHT:
+        # ``as_of_block`` defaults to self.height to preserve every
+        # existing apply-time / propose-time callsite byte-for-byte
+        # (those paths set self.height == block_number being committed,
+        # so the default IS correct for them).  Only cold-load /
+        # post-load verification paths need to override.
+        gate_height = (
+            self.height if as_of_block is None else int(as_of_block)
+        )
+        if gate_height >= REACT_TX_HEIGHT:
             entity_root = _mix_state_roots(
                 entity_root,
                 self.reaction_state.state_root_contribution(),
@@ -6156,7 +6216,7 @@ class Blockchain:
         # messagechain/consensus/accumulator_commitment.py for the
         # full committed-fields set.
         from messagechain.config import ACCUMULATOR_COMMITMENT_HEIGHT
-        if self.height >= ACCUMULATOR_COMMITMENT_HEIGHT:
+        if gate_height >= ACCUMULATOR_COMMITMENT_HEIGHT:
             from messagechain.consensus.accumulator_commitment import (
                 compute_accumulator_root,
             )
