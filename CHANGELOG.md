@@ -4,6 +4,64 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.96.2] — 2026-05-30 — HOTFIX: mainnet wedge at h=3000
+
+Critical hotfix to unwedge mainnet.  Both validators have been
+stuck at h=3000 (the ``ACCUMULATOR_COMMITMENT_HEIGHT`` activation
+block) since 2026-05-29 with the IDENTICAL ``AttributeError``
+crash on every block-production attempt.
+
+The 1.96.0 CHANGELOG anticipated state-root divergence as the
+wedge mode (and recommended revert+splice+re-attempt).  The
+actual failure was different: a code bug in 1.96.0's post-
+activation propose-side state_root path.
+
+### Fixed
+
+* **``_compute_post_state_root_via_real_apply`` now provides a
+  deterministic ``block_hash`` placeholder when the BlockDraft is
+  missing the attribute.**  Post-``ACCUMULATOR_COMMITMENT_HEIGHT``,
+  ``compute_post_state_root_for_block`` routes through a
+  snapshot-apply-rollback dry-run.  The propose-side block is a
+  ``BlockDraft`` (``types.SimpleNamespace``) WITHOUT a
+  ``block_hash`` attribute -- block_hash commits to
+  ``header.state_root`` which the dry-run is computing, so it
+  cannot be set yet.  ``_apply_archive_duty`` reads
+  ``block.block_hash`` at challenge-block heights to seed
+  ``compute_challenges()``; the missing attr raised
+  ``AttributeError``, propose_block raised, the block-production
+  loop logged ERROR every cadence interval, and the chain WEDGED.
+  Mainnet hit this at h=3000 because BOTH conditions held
+  simultaneously: ``3000 == ACCUMULATOR_COMMITMENT_HEIGHT`` AND
+  ``3000 % ARCHIVE_CHALLENGE_INTERVAL == 0``.
+
+  Fix: ``block.block_hash`` defaults to ``b"\x00" * 32`` when the
+  draft is missing the attribute.  Safety: the seed lands in
+  ``archive_active_snapshot.challenge_heights``, which is NOT in
+  ``_COMMITTED_FIELDS`` (custom objects are out of scope for the
+  v1 accumulator commitment).  The dry-run's bogus heights don't
+  reach the canonical state_root; the dry-run snapshot is rolled
+  back wholesale by ``_restore_memory_snapshot``; the LIVE apply
+  uses the real block_hash and produces the canonical snapshot
+  post-apply.  Both paths converge on the same state_root.
+
+  The pre-existing ``test_end_to_end_activation_chain_advances``
+  test lowered ``ACCUMULATOR_COMMITMENT_HEIGHT=1`` and proposed
+  h=1,2,3 -- none of which are challenge blocks at the default
+  ``ARCHIVE_CHALLENGE_INTERVAL=100`` -- so the conjunction never
+  fired pre-deployment.  ``test_audit_r60_mainnet_wedge_block_
+  hash_dry_run.py`` closes that gap by lowering both constants so
+  the dry-run hits a challenge-block height post-activation.
+  (`8feda2d`)
+
+### Operator note
+
+After upgrading to 1.96.2, validators resume proposing blocks
+immediately.  No state surgery required, no chain.db splice, no
+genesis reset.  The chain.db at h=3000 on both validators is
+correct -- the wedge is purely in the in-process block-production
+loop, which the new binary fixes.
+
 ## [1.96.1] — 2026-05-30
 
 Audit r60 ships the top-2 findings (the #1 structural inclusion-
