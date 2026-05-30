@@ -1286,8 +1286,12 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
     Verify a signature against a Merkle-tree root public key.
 
     1. Structural validation of the signature (sizes, counts, ranges)
-    2. Verify the WOTS+ signature against the leaf public key
-    3. Verify the leaf public key is in the Merkle tree (via auth path)
+    2. Cache lookup on the (msg_hash, sig_hash, root_pk) triple — return
+       True immediately on hit, avoiding the full WOTS+ chain walk.
+    3. Verify the WOTS+ signature against the leaf public key
+    4. Verify the leaf public key is in the Merkle tree (via auth path)
+    5. Store positive results in the cache so duplicate verifies are
+       short-circuited next time.
 
     Returns False on any structural defect or verification failure. Never
     raises on malformed input — all rejection is via False return.
@@ -1322,6 +1326,47 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
     if signature.leaf_index < 0 or signature.leaf_index >= num_leaves:
         return False
 
+    # Audit r60 #2: signature-verification cache.  WOTS+ verify is
+    # ~67 hash-chain walks × ~67 SHA3 ops each = ~4500 hash ops per
+    # call; the SAME (msg_hash, sig, root_pk) triple is re-verified
+    # at mempool admission, block validation, reorg replay, and
+    # EquivocationWatcher observation -- every duplicate burns full
+    # cost.  The cache is the existing ``Blockchain.sig_cache``
+    # infrastructure (allocated + invalidated on every reorg) that
+    # was previously wired but never consulted; routing both
+    # lookup/store through this single ``verify_signature``
+    # chokepoint makes every caller benefit without per-site edits
+    # and makes the existing ``invalidate()`` calls meaningful again.
+    # Only positive results are cached -- the cache layer enforces
+    # that (negative caching would let transient verifier disagreement
+    # become permanent until eviction).
+    _sig_hash: bytes | None = None
+    try:
+        # Late-import to avoid any future circular-import risk; the
+        # global cache is a process-wide singleton so repeated lookups
+        # are O(1) after the first.
+        from messagechain.crypto.sig_cache import get_global_cache as _sc
+        _cache = _sc()
+        # Compact, deterministic identity for the signature blob.  We
+        # hash the canonical wire form so two equal Signature objects
+        # produce the same cache key regardless of in-memory identity.
+        # Failure path (e.g., partial / corrupt Signature where
+        # to_bytes() raises) skips caching and falls through to a
+        # fresh verify -- the structural-validation block above
+        # already rejected the malformed cases, so to_bytes() should
+        # not raise here, but defending against future Signature
+        # shape changes is cheap.
+        _sig_hash = hashlib.new(
+            HASH_ALGO, signature.to_bytes(),
+        ).digest()
+        if _cache.lookup(
+            bytes(message_hash), _sig_hash, bytes(root_public_key),
+        ) is True:
+            return True
+    except Exception:
+        _cache = None
+        _sig_hash = None
+
     # Step 1: Verify WOTS+ signature.  Pass through the signature's
     # own sig_version so legacy V1 sigs are verified under the old
     # checksum encoding (which the live chain committed with before
@@ -1342,4 +1387,18 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
         idx >>= 1
 
     # Constant-time comparison to avoid timing side-channels.
-    return hmac.compare_digest(current, root_public_key)
+    result = hmac.compare_digest(current, root_public_key)
+    if result and _cache is not None and _sig_hash is not None:
+        # Cache the positive outcome so the next caller (which may
+        # be in a different layer entirely: mempool, blockchain
+        # apply, equivocation watcher) short-circuits.  ``store``
+        # is itself idempotent + thread-safe; concurrent stores
+        # converge on the same entry.
+        try:
+            _cache.store(
+                bytes(message_hash), _sig_hash,
+                bytes(root_public_key), True,
+            )
+        except Exception:
+            pass
+    return result
