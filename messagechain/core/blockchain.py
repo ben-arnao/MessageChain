@@ -6287,6 +6287,41 @@ class Blockchain:
         ):
             if not hasattr(block.header, header_attr):
                 setattr(block.header, header_attr, None)
+        # Audit r60 mainnet-wedge fix (2026-05-30): top-level
+        # ``block.block_hash`` surface required by ``_apply_archive_
+        # duty``'s challenge-block snapshot seed
+        # (``compute_challenges(block.block_hash, height, k=...)``).
+        # The draft is a BlockDraft (SimpleNamespace) WITHOUT
+        # block_hash -- block_hash commits to header.state_root
+        # which we're computing here, so it cannot be set yet.  At
+        # challenge-block heights (h % ARCHIVE_CHALLENGE_INTERVAL ==
+        # 0) the missing attr raises AttributeError, propose_block
+        # raises, the block-production loop logs ERROR every cadence
+        # interval, and the chain WEDGES.  This is exactly what
+        # happened on mainnet at h=3000 (= ACCUMULATOR_COMMITMENT_
+        # HEIGHT, AND 3000 % 100 == 0) starting 2026-05-29.
+        #
+        # Safety of the placeholder: ``compute_challenges`` seeds
+        # ``archive_active_snapshot.challenge_heights`` which is NOT
+        # in ``_COMMITTED_FIELDS`` -- the dry-run's bogus heights
+        # don't reach the canonical state_root.  The dry-run snapshot
+        # is rolled back wholesale by ``_restore_memory_snapshot``;
+        # the LIVE apply uses the real block_hash and produces the
+        # canonical snapshot post-apply.  Both paths converge on the
+        # same state_root because the divergent quantity is
+        # uncommitted by design (custom objects are out of scope for
+        # the v1 accumulator commitment per
+        # ``accumulator_commitment.py``'s "What's out" list).
+        #
+        # Pre-existing ``test_end_to_end_activation_chain_advances``
+        # tested h=1,2,3 with activation=1 -- none of which are
+        # challenge blocks at the default INTERVAL=100, so the bug
+        # slipped through.  The regression test in
+        # ``test_audit_r60_mainnet_wedge_block_hash_dry_run.py``
+        # closes the gap by lowering BOTH activation AND interval
+        # so a challenge block falls post-activation.
+        if not hasattr(block, "block_hash"):
+            block.block_hash = b"\x00" * 32
         if self.db is not None:
             self.db.begin_transaction()
         try:
