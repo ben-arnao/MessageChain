@@ -4,6 +4,15 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.97.2] — 2026-06-21
+
+### Fixed
+- **Unbounded `FinalityTracker` that bloated per-block state snapshots — root cause of the 2026-06-20 validator-1 disk wedge.** The in-memory FinalityTracker was append-only: `_attestation_objects` held a full `Attestation` per validator per height for the chain's entire lifetime. Serialized into every per-block state snapshot, it reached ~6.7 MB (99% of a 6.8 MB snapshot) at mainnet h=5255 and kept growing, driving the `state_snapshots` table to ~7.4 GB and filling validator-1's 10 GB disk (the actual ledger is ~28 MB). A `FinalityTracker.prune()` method existed but was never called; it is now invoked every block from `_record_stake_snapshot` at a new near-tip horizon. Finality *status* (`finalized` / `finalized_height`) is never pruned, so this is a local storage knob — not a consensus parameter — and nodes running different values still agree on what is finalized. (275783a)
+
+### Changed
+- Added `FINALITY_ATTESTATION_RETENTION_BLOCKS = 2 * FINALITY_INTERVAL` — how many blocks of raw per-(validator, height) attestation detail the FinalityTracker retains before pruning. Safe near-tip horizon: finality counting completes within ~1 interval, proposer-draining reads the immediate parent, reorg is bounded by `MAX_REORG_DEPTH`, and equivocation slashing runs through the independent equivocation_watcher.
+- Cut `_SNAPSHOT_RETENTION_BLOCKS` 1000 → 150 (1.5× `MAX_REORG_DEPTH`). The 10× buffer only multiplied per-snapshot cost once snapshots stopped being tiny — which was itself the bloat. Net: a bounded `state_snapshots` table ~99% smaller, restoring the low-footprint full-node property.
+
 ## [1.97.1] — 2026-05-30 — HOTFIX: cold-load snapshot at commit-point + smart-rewind for legacy chain.db
 
 The deeper architectural issue discovered during the 1.97.0
