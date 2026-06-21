@@ -4,7 +4,16 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.97.4] — 2026-06-21 — correct, consensus-safe FinalityTracker bound
+## [1.97.5] — 2026-06-21 — REVERT of 1.97.4; FinalityTracker pruning abandoned as consensus-unsafe
+
+### Reverted
+- **Fully reverts the 1.97.4 FinalityTracker prune (f94493a).** 1.97.4 was the "correct, stake-pin-aligned" retry of the bloat fix; deployed as a canary to validator-1, it **still caused a `state_root` divergence** — validator-2 rejected validator-1's block with `invalid_block: Invalid state_root — state commitment mismatch` and banned it (the canary's coarse log-sampling initially missed the offense). So pruning the in-memory FinalityTracker's per-(validator, height) attestation maps changes consensus-committed state **even when the prune cutoff is aligned with the stake-pin retention** — the reasoning that un-pinned targets are "frozen" is incomplete; some `state_root` input still depends on the pruned data in a way not fully characterized.
+
+  **Conclusion: pruning the live FinalityTracker is abandoned as a fix.** Two independent attempts (1.97.2 at `block−200`, 1.97.4 at `block−FINALITY_VOTE_MAX_AGE_BLOCKS`) both diverged on mainnet. The same hazard applies to trimming the tracker out of the snapshot serialization (a cold-loaded node would diverge identically). The underlying issue is that **finality is stalled in the 2-validator bootstrap network** (the 2/3-stake + min-validator threshold is never met), so nothing finalizes and no attestation data is ever genuinely dead. A safe bound likely requires either working finality (more validators) so the tracker can be pruned at the finalized boundary, or a deeper consensus-state rework — out of scope for a patch. The snapshot bloat is real but **non-urgent**: validator disks were grown to 30 GB (2026-06-20), giving years of runway.
+
+- Recovery: both validators reset to no-prune code on a single shared canonical chain.db and reconverged.
+
+## [1.97.4] — 2026-06-21 — ⚠️ BROKEN / SUPERSEDED BY 1.97.5 — DO NOT DEPLOY (consensus-unsafe; FinalityTracker prune diverges state_root)
 
 ### Fixed
 - **Bounds the unbounded `FinalityTracker` that bloated every state snapshot — the correct version of the fix reverted in 1.97.3.** The tracker's `_attestation_objects` (a full `Attestation` per validator per height) grew for the chain's lifetime and reached ~6.7 MB (99% of a 6.8 MB snapshot) at mainnet h=5255, driving the `state_snapshots` table to ~7.4 GB and filling validator-1's disk. It is now pruned from `_record_stake_snapshot` at **`block_number − FINALITY_VOTE_MAX_AGE_BLOCKS`** — the exact same cutoff as the stake-snapshot pins. (f94493a)

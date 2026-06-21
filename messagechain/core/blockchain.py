@@ -2595,19 +2595,9 @@ class Blockchain:
     # Periodicity for snapshot-on-apply persistence (1.52.0).  Every
     # block apply persists a snapshot row; pruning trims rows below
     # ``current - SNAPSHOT_RETENTION_BLOCKS`` so disk stays bounded.
-    #
-    # Reorg-restore loads the exact-height snapshot at the reorg
-    # ancestor, which is within MAX_REORG_DEPTH (100) of the tip, so
-    # retention only needs to exceed the reorg depth with a small
-    # buffer.  150 (1.5× MAX_REORG_DEPTH) keeps every in-reorg-window
-    # ancestor snapshot with margin.  The prior 10× (1000) buffer
-    # multiplied the per-snapshot cost by ~7× for no consensus benefit;
-    # combined with the FinalityTracker prune (which stops per-snapshot
-    # size from growing unbounded), this bounds the state_snapshots
-    # table to a small multiple of one snapshot.  This is a pure
-    # local-storage knob -- retention does not affect any state the
-    # state_root commits to.
-    _SNAPSHOT_RETENTION_BLOCKS: int = 150
+    # 1000 blocks ≈ 7 days at 600s/block, ~10× MAX_REORG_DEPTH (100)
+    # so any reorg up to the depth limit can find an ancestor snapshot.
+    _SNAPSHOT_RETENTION_BLOCKS: int = 1000
 
     # Per-node HMAC secret authenticating snapshot blobs.  Audit r29
     # #1: ``pickle.loads`` on a tampered ``state_snapshots`` row is a
@@ -10313,37 +10303,6 @@ class Blockchain:
         cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
         if cutoff > 0:
             self._prune_stake_snapshots_before(cutoff)
-            # Bound the FinalityTracker's per-(validator, height)
-            # attestation maps at the SAME cutoff as the stake-snapshot
-            # pins.  Left unpruned, ``_attestation_objects`` (a full
-            # Attestation per validator per height) grows for the chain's
-            # lifetime and dominated the per-block state snapshot (~6.7 MB
-            # / 99% of it at mainnet h=5255 -- the unbounded growth that
-            # wedged validator-1's disk on 2026-06-20).
-            #
-            # CONSENSUS SAFETY -- why this exact cutoff and no tighter:
-            # ``add_attestation`` ACCUMULATES ``attestations[bh]`` /
-            # ``attested_stake[bh]`` across multiple blocks (an
-            # attestation targeting block H may be included in a later
-            # block H+k), and the finalization decision -- which resets
-            # ``blocks_since_last_finalization`` (a state_root field) --
-            # depends on that running total.  Pruning a target that can
-            # STILL receive attestations would make a pruned node
-            # re-accumulate from zero and reach a different ``justified``
-            # decision than an unpruned peer -> state_root divergence
-            # (the 2026-06-21 1.97.2 incident, which pruned at a tighter
-            # window).  But an attestation is only admitted while its
-            # target's pinned stake snapshot exists
-            # (``resolve_pinned_attestation_stake`` returns None and
-            # ``_process_attestations`` skips it otherwise), and that pin
-            # is pruned at exactly THIS cutoff.  So once a target falls
-            # below ``cutoff`` no attestation for it can ever be admitted
-            # again -- its tracker entry is frozen and pruning it cannot
-            # change any finalization decision.  ``finalized`` /
-            # ``finalized_height`` are never pruned, so finality status of
-            # old blocks is preserved.  Do NOT tighten this window below
-            # FINALITY_VOTE_MAX_AGE_BLOCKS.
-            self.finality.prune(cutoff)
         if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
             self.db.add_stake_snapshot(block_number, stakes)
             if cutoff > 0:
