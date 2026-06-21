@@ -2183,28 +2183,6 @@ MAX_RELEASE_ANNOUNCE_TX_BYTES = 20_480
 # realistic gossip-lag window and still bounds the lookback.
 FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 
-# How many blocks of raw per-(validator, height) attestation detail the
-# in-memory FinalityTracker keeps before pruning (``FinalityTracker.
-# prune``, driven from ``Blockchain._record_stake_snapshot``).  This
-# bounds ``_attestation_objects`` -- a full Attestation per validator
-# per height -- which is the single largest contributor to the per-block
-# state snapshot.  Left unpruned it grew to ~6.7 MB (99% of the
-# snapshot) at mainnet h=5255 and filled validator-1's disk (2026-06-20).
-#
-# This is a LOCAL storage/memory knob, NOT a consensus parameter:
-# finality STATUS (``finalized`` / ``finalized_height``) is never pruned,
-# so nodes running different values still agree on what is finalized.
-# The retained data is only read near the tip -- finality counting
-# (a block finalizes within ~1 FINALITY_INTERVAL), proposer attestation-
-# draining (the immediate parent), and reorg (<= MAX_REORG_DEPTH = 100
-# blocks).  Equivocation slashing runs through the independent
-# equivocation_watcher, not these maps.  2 × FINALITY_INTERVAL = 200
-# blocks is 2× both the finality and reorg horizons -- ample margin --
-# while keeping the snapshot small.  A late attestation for a pruned-but-
-# still-stake-pinned height simply re-creates a single entry that the
-# next prune drops again; harmless.
-FINALITY_ATTESTATION_RETENTION_BLOCKS = 2 * FINALITY_INTERVAL
-
 # Witness separation — split block storage into state-transition data
 # and witness data (WOTS signatures + Merkle auth paths).  After
 # finalization, ~97% of a block's bytes are witness data that serves

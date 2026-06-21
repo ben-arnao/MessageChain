@@ -2595,18 +2595,9 @@ class Blockchain:
     # Periodicity for snapshot-on-apply persistence (1.52.0).  Every
     # block apply persists a snapshot row; pruning trims rows below
     # ``current - SNAPSHOT_RETENTION_BLOCKS`` so disk stays bounded.
-    #
-    # Reorg-restore loads the exact-height snapshot at the reorg
-    # ancestor, which is within MAX_REORG_DEPTH (100) of the tip, so
-    # retention only needs to exceed the reorg depth with a small
-    # buffer.  The prior 10x (1000) buffer multiplied the per-snapshot
-    # cost by ~7x for no consensus benefit -- once the per-block
-    # snapshot stopped being tiny (the unbounded-FinalityTracker bloat,
-    # fixed by pruning the tracker in ``_record_stake_snapshot``), that
-    # over-retention is what turned a bounded table into hundreds of MB.
-    # 150 (1.5x MAX_REORG_DEPTH) keeps every in-reorg-window ancestor
-    # snapshot with margin while bounding the table.
-    _SNAPSHOT_RETENTION_BLOCKS: int = 150
+    # 1000 blocks ≈ 7 days at 600s/block, ~10× MAX_REORG_DEPTH (100)
+    # so any reorg up to the depth limit can find an ancestor snapshot.
+    _SNAPSHOT_RETENTION_BLOCKS: int = 1000
 
     # Per-node HMAC secret authenticating snapshot blobs.  Audit r29
     # #1: ``pickle.loads`` on a tampered ``state_snapshots`` row is a
@@ -10308,27 +10299,10 @@ class Blockchain:
         # cold-restarted node only rehydrates the trailing window
         # regardless -- the in-memory tail was just inconsistent with
         # the disk-mirror contract.
-        from messagechain.config import (
-            FINALITY_VOTE_MAX_AGE_BLOCKS,
-            FINALITY_ATTESTATION_RETENTION_BLOCKS,
-        )
+        from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
         cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
         if cutoff > 0:
             self._prune_stake_snapshots_before(cutoff)
-        # Bound the FinalityTracker's per-(validator,height) attestation
-        # maps.  Without this the tracker is append-only for the chain's
-        # lifetime: ``_attestation_objects`` holds a full Attestation
-        # object per validator per height forever, which dominated the
-        # per-block state snapshot (~6.7 MB / 99% of it at mainnet h=5255
-        # on 2026-06-20 -- the bloat that wedged validator-1's disk).
-        # Pruned at a tighter, near-tip horizon than the stake snapshots
-        # (see FINALITY_ATTESTATION_RETENTION_BLOCKS) because finality
-        # status -- the only thing that must survive -- lives in
-        # ``finalized`` / ``finalized_height``, which ``prune`` never
-        # touches; the raw attestation detail is only read near the tip.
-        att_cutoff = block_number - FINALITY_ATTESTATION_RETENTION_BLOCKS
-        if att_cutoff > 0:
-            self.finality.prune(att_cutoff)
         if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
             self.db.add_stake_snapshot(block_number, stakes)
             if cutoff > 0:

@@ -4,7 +4,12 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.97.2] — 2026-06-21
+## [1.97.3] — 2026-06-21 — REVERT of 1.97.2 (consensus-unsafe)
+
+### Reverted
+- **Fully reverts the 1.97.2 FinalityTracker prune (275783a).** 1.97.2 was deployed to validator-1 and immediately caused a `state_root` divergence: validator-1 (pruned) and validator-2 (unpruned) computed different **inactivity-leak** burns (`burned 7 tokens from 1 inactive` vs `burned 14 tokens from 2 inactive`) for the same block, so v1 rejected v2's blocks as `Invalid state_root — state commitment mismatch` and partitioned off the chain. The FinalityTracker's per-(validator, height) attestation maps were assumed to be a non-consensus local cache, but the inactivity-leak / validator-activity accounting reads them and that **mutates balances, which ARE committed to the state_root**. Pruning them therefore changes consensus state. Recovery: validator-1 rolled back to 1.97.1 and restored from validator-2's canonical chain.db; both reconverged. **1.97.2 must not be deployed.** A correct fix for the underlying snapshot bloat (which is real but non-urgent on the current 30 GB validator disks) must avoid touching any attestation state that feeds reward/penalty/state_root computation.
+
+## [1.97.2] — 2026-06-21 — ⚠️ BROKEN / SUPERSEDED BY 1.97.3 — DO NOT DEPLOY (consensus-unsafe; see 1.97.3)
 
 ### Fixed
 - **Unbounded `FinalityTracker` that bloated per-block state snapshots — root cause of the 2026-06-20 validator-1 disk wedge.** The in-memory FinalityTracker was append-only: `_attestation_objects` held a full `Attestation` per validator per height for the chain's entire lifetime. Serialized into every per-block state snapshot, it reached ~6.7 MB (99% of a 6.8 MB snapshot) at mainnet h=5255 and kept growing, driving the `state_snapshots` table to ~7.4 GB and filling validator-1's 10 GB disk (the actual ledger is ~28 MB). A `FinalityTracker.prune()` method existed but was never called; it is now invoked every block from `_record_stake_snapshot` at a new near-tip horizon. Finality *status* (`finalized` / `finalized_height`) is never pruned, so this is a local storage knob — not a consensus parameter — and nodes running different values still agree on what is finalized. (275783a)
