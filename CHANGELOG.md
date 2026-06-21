@@ -4,6 +4,16 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.97.4] — 2026-06-21 — correct, consensus-safe FinalityTracker bound
+
+### Fixed
+- **Bounds the unbounded `FinalityTracker` that bloated every state snapshot — the correct version of the fix reverted in 1.97.3.** The tracker's `_attestation_objects` (a full `Attestation` per validator per height) grew for the chain's lifetime and reached ~6.7 MB (99% of a 6.8 MB snapshot) at mainnet h=5255, driving the `state_snapshots` table to ~7.4 GB and filling validator-1's disk. It is now pruned from `_record_stake_snapshot` at **`block_number − FINALITY_VOTE_MAX_AGE_BLOCKS`** — the exact same cutoff as the stake-snapshot pins. (f94493a)
+
+  **Why this cutoff and not tighter (the 1.97.2 lesson):** `add_attestation` accumulates `attestations[bh]` / `attested_stake[bh]` across multiple blocks, and the finalization decision — which resets `blocks_since_last_finalization`, a field the `state_root` commits to — depends on that running total. 1.97.2 pruned at a tighter window (`block−200`), so a target in the 200–1000 window could still receive an attestation; a pruned node re-accumulated it from zero, reached a different `justified` decision than an unpruned peer, and rejected its blocks (`Invalid state_root`). The safe boundary is the stake-pin retention: an attestation is only admitted while its target's pinned stake snapshot exists (`resolve_pinned_attestation_stake` → `None` → skipped otherwise), and that pin is pruned at this exact cutoff — so below it, no attestation can ever be admitted again, the tracker entry is frozen, and pruning it cannot change any decision. `finalized` / `finalized_height` are never pruned.
+
+### Changed
+- Cut `_SNAPSHOT_RETENTION_BLOCKS` 1000 → 150 (1.5× `MAX_REORG_DEPTH`). Pure local-storage knob (retention does not affect any `state_root` input). Combined with the bounded snapshot size, this bounds the `state_snapshots` table to a small multiple of one snapshot instead of ~7.4 GB and growing.
+
 ## [1.97.3] — 2026-06-21 — REVERT of 1.97.2 (consensus-unsafe)
 
 ### Reverted
