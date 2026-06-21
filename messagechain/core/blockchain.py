@@ -2595,9 +2595,27 @@ class Blockchain:
     # Periodicity for snapshot-on-apply persistence (1.52.0).  Every
     # block apply persists a snapshot row; pruning trims rows below
     # ``current - SNAPSHOT_RETENTION_BLOCKS`` so disk stays bounded.
-    # 1000 blocks ≈ 7 days at 600s/block, ~10× MAX_REORG_DEPTH (100)
-    # so any reorg up to the depth limit can find an ancestor snapshot.
-    _SNAPSHOT_RETENTION_BLOCKS: int = 1000
+    #
+    # PURELY a local-storage knob: retention controls how many old
+    # snapshot ROWS chaindb keeps; it does NOT affect any state the
+    # state_root commits to, so two nodes with different retention are
+    # fully consensus-compatible (unlike pruning the in-memory
+    # FinalityTracker, which is consensus-unsafe -- see the 1.97.2 /
+    # 1.97.4 reverts and [[project_finalitytracker_prune_unsafe]]).
+    #
+    # Reorg-restore loads the exact-height snapshot at the reorg
+    # ancestor, which is within MAX_REORG_DEPTH (100) of the tip, so
+    # retention only needs to exceed the reorg depth with a small
+    # buffer.  150 (1.5x MAX_REORG_DEPTH) keeps every in-reorg-window
+    # ancestor snapshot with margin.  The prior 10x (1000) buffer made
+    # the state_snapshots table grow ~67 GB/yr at the (unbounded, see
+    # the link above) per-snapshot size, refilling a 30 GB validator
+    # disk in months; 150 cuts that ~6.7x to ~10 GB/yr and reclaims the
+    # bulk of the existing table on the next prune + VACUUM.  This does
+    # NOT bound growth (the FinalityTracker still grows while finality
+    # is stalled in the 2-validator bootstrap) -- it buys years of
+    # runway.  A true bound needs working finality (>=3 validators).
+    _SNAPSHOT_RETENTION_BLOCKS: int = 150
 
     # Per-node HMAC secret authenticating snapshot blobs.  Audit r29
     # #1: ``pickle.loads`` on a tampered ``state_snapshots`` row is a
