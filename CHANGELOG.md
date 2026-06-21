@@ -4,6 +4,13 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.97.6] — 2026-06-21 — safe state-snapshot retention cut (storage relief without consensus risk)
+
+### Changed
+- **`_SNAPSHOT_RETENTION_BLOCKS` 1000 → 150.** The `state_snapshots` table grew ~67 GB/yr at retention 1000 (1000 rows × the unbounded per-snapshot size — see 1.97.5), refilling a 30 GB validator disk in ~months. Retention is a **pure local-storage knob**: it controls how many old snapshot *rows* chaindb keeps and does NOT affect any `state_root` input, so nodes with different retention stay fully consensus-compatible (this is the safe storage lever, unlike pruning the in-memory FinalityTracker which is consensus-unsafe). 150 (1.5× `MAX_REORG_DEPTH`) keeps every in-reorg-window ancestor snapshot, cuts growth ~6.7× to ~10 GB/yr, and reclaims the bulk of the existing table on the next prune + `VACUUM`. (7d09f00)
+
+  **Scope:** this buys years of runway; it is **not** a hard bound. The FinalityTracker still grows while finality is stalled in the 2-validator bootstrap (a block is attested only by the ~50%-stake non-proposer and never reaches the 2/3 finality threshold). A true bound requires working finality — i.e. **≥3 validators** — after which the tracker can be pruned safely at the finalized boundary.
+
 ## [1.97.5] — 2026-06-21 — REVERT of 1.97.4; FinalityTracker pruning abandoned as consensus-unsafe
 
 ### Reverted
