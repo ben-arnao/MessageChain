@@ -4,6 +4,11 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.98.1] — 2026-06-22 — lower the FinalityTracker prune activation height to 5370
+
+### Changed
+- `FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT` 5400 → **5370**. The network has no users, so there is no reason to wait ~8-10 h for the original runway; 5370 is the next block after the deploy tip (5369), so the coordinated prune activates ~1 block after the clean-reset restart. Same hard fork as 1.98.0, just an earlier (still-coordinated) activation. Deploy via clean-reset so both validators activate at the same block.
+
 ## [1.98.0] — 2026-06-22 — coordinated FinalityTracker prune (permanent snapshot-size bound), activation height 5400
 
 ### Added — hard fork (activation height 5400)
