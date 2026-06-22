@@ -10317,10 +10317,32 @@ class Blockchain:
         # cold-restarted node only rehydrates the trailing window
         # regardless -- the in-memory tail was just inconsistent with
         # the disk-mirror contract.
-        from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
+        from messagechain.config import (
+            FINALITY_VOTE_MAX_AGE_BLOCKS,
+            FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT,
+        )
         cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
         if cutoff > 0:
             self._prune_stake_snapshots_before(cutoff)
+            # Coordinated hard fork: bound the FinalityTracker's
+            # per-(validator, height) attestation maps -- the single
+            # largest contributor to the per-block state snapshot, which
+            # grows unbounded while finality is stalled (the 2026-06-20
+            # disk wedge).  This MUST be activation-gated, NOT a rolling
+            # change: the prune alters ``blocks_since_last_finalization``
+            # (a state_root field) via the finalization decision, so a
+            # node that prunes while its peer does not diverges (1.97.2 /
+            # 1.97.4 incidents).  Gating on a height makes every node
+            # begin pruning at the SAME block with the SAME deterministic
+            # cutoff, so they prune identically and stay in consensus.
+            # ``finalized`` / ``finalized_height`` are never pruned, so
+            # finality status is preserved.  Same cutoff as the stake-
+            # snapshot pins above: below it no attestation can be
+            # (re-)admitted (``resolve_pinned_attestation_stake`` -> None
+            # -> skipped), so the pruned entries are frozen.
+            act = FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT
+            if act is not None and block_number >= act:
+                self.finality.prune(cutoff)
         if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
             self.db.add_stake_snapshot(block_number, stakes)
             if cutoff > 0:

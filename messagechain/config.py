@@ -2183,6 +2183,28 @@ MAX_RELEASE_ANNOUNCE_TX_BYTES = 20_480
 # realistic gossip-lag window and still bounds the lookback.
 FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 
+# Activation height for the coordinated FinalityTracker prune (hard fork).
+#
+# Pruning the in-memory FinalityTracker's per-(validator, height)
+# attestation maps bounds the per-block state snapshot, but it CHANGES
+# state the state_root commits to (via the finalization decision in
+# ``_process_attestations`` -> ``blocks_since_last_finalization``).  A
+# rolling upgrade therefore diverged mainnet twice (1.97.2 / 1.97.4):
+# the upgraded node pruned while its peer did not, and the two computed
+# different state_roots.  Gating the prune on a single activation height
+# fixes that: every node keeps the prune INACTIVE until block H, by which
+# point all nodes are on the new code, and then ALL nodes begin pruning
+# at the SAME block with the SAME deterministic cutoff -- so they prune
+# identically and continue to agree.  This is the standard coordinated-
+# hard-fork pattern (same as the Tier activation heights).
+#
+# Sentinel ``None`` = prune disabled (the prune never fires).  Set to a
+# concrete height ABOVE the current tip with runway to roll every node
+# before activation.  Tests patch this to a low value to exercise the
+# prune.  See [[project_finalitytracker_prune_unsafe]] for the full
+# incident history that motivated the activation gate.
+FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT: int | None = None
+
 # Witness separation — split block storage into state-transition data
 # and witness data (WOTS signatures + Merkle auth paths).  After
 # finalization, ~97% of a block's bytes are witness data that serves
