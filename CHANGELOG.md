@@ -4,6 +4,13 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.98.0] — 2026-06-22 — coordinated FinalityTracker prune (permanent snapshot-size bound), activation height 5400
+
+### Added — hard fork (activation height 5400)
+- **Bounds the FinalityTracker — the true permanent fix for the state-snapshot bloat.** The tracker's per-(validator, height) attestation maps (`_attestation_objects` etc.) grew for the chain's lifetime and were ~99% of every per-block state snapshot (the 2026-06-20 disk wedge). They are now pruned at the stake-pin horizon (`block − FINALITY_VOTE_MAX_AGE_BLOCKS`), gated on `FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT = 5400` so **all nodes begin pruning at the same block** (a coordinated hard fork, not a rolling change). Combined with the 1.97.6 retention cut, this fixes the snapshot *size* (~6.8 MB → ~1.3 MB) as well as the count, so the `state_snapshots` table is **bounded with no growth** (~200 MB) instead of growing ~10–67 GB/yr.
+
+  **Why this is safe where 1.97.2 / 1.97.4 were not:** those were reverted as "consensus-unsafe," but a read-only probe on the real mainnet chain.db (h=5357) and new unit tests proved that pruning the tracker leaves the computed `state_root` **byte-identical** — the state_root is finalized before `_process_attestations` (the only tracker consumer) runs, and that only resets `blocks_since_last_finalization` on a *finalization flip*, which the stake-pin-bounded prune never causes (and finality has never fired on this chain: `finalized_height = 0`). The earlier mainnet divergences were the **restart-fork** (both validators proposing the same height during a rolling-upgrade restart), not the prune. The activation gate is belt-and-suspenders: even if that analysis were wrong, a coordinated activation cannot produce the one-pruned-one-not divergence. Deploy via clean-reset (both nodes restarted to the same tip) to avoid the restart-fork. `finalized` / `finalized_height` are never pruned. (36c95a1)
+
 ## [1.97.6] — 2026-06-21 — safe state-snapshot retention cut (storage relief without consensus risk)
 
 ### Changed

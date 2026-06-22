@@ -2203,7 +2203,7 @@ FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 # before activation.  Tests patch this to a low value to exercise the
 # prune.  See [[project_finalitytracker_prune_unsafe]] for the full
 # incident history that motivated the activation gate.
-FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT: int | None = None
+FINALITY_TRACKER_PRUNE_ACTIVATION_HEIGHT: int | None = 5400
 
 # Witness separation — split block storage into state-transition data
 # and witness data (WOTS signatures + Merkle auth paths).  After
